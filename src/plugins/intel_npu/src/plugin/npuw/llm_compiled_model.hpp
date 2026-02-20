@@ -101,7 +101,7 @@ private:
     std::vector<uint32_t> m_kvcache_sizes;  // Corresponding KV cache sizes for each variant
 
     // Support LoRA
-    void convert_stateful_lora_to_stateless(std::shared_ptr<ov::Model>& model);
+    // void convert_stateful_lora_to_stateless(std::shared_ptr<ov::Model>& model);
     uint32_t m_max_lora_rank = 32;
 
     // Support prefix caching
@@ -125,6 +125,23 @@ private:
     void compile_generate_model_variants(const std::vector<std::shared_ptr<ov::Model>>& generate_model_variants,
                                          const std::shared_ptr<const ov::IPlugin>& plugin,
                                          const ov::AnyMap& generate_config);
+
+    std::vector<std::shared_ptr<ov::Model>> run_generate_transformations(
+        std::shared_ptr<ov::Model>& kvcache_model,
+        uint32_t max_prompt_len,
+        uint32_t min_response_len,
+        uint32_t max_generation_token_len,
+        ov::element::Type kv_cache_storage_type,
+        bool is_moe);
+
+    std::shared_ptr<ov::Model> run_prefill_transformations(
+        std::shared_ptr<ov::Model>& prefill_model,
+        uint32_t max_prompt_len,
+        uint32_t min_response_len,
+        uint32_t max_generation_token_len,
+        ov::element::Type kv_cache_storage_type,
+        bool slice_out_embeds_flag,
+        bool is_moe);
 
     bool m_is_eagle = false;
 };

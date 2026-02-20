@@ -595,7 +595,7 @@ bool is_fake_cvt_to_key_tensor(const ov::Input<ov::Node>& reader) {
     return fc_reader.begin()->get_index() == 1;
 }
 
-void expose_runtime_states_as_outputs(std::shared_ptr<ov::Model>& model) {
+void expose_runtime_states_as_outputs(const std::shared_ptr<ov::Model>& model) {
     // Find all ReadValue nodes
     ov::NodeVector read_value_nodes;
     for (const auto& op : model->get_ops()) {
@@ -650,7 +650,7 @@ void expose_runtime_states_as_outputs(std::shared_ptr<ov::Model>& model) {
     model->validate_nodes_and_infer_types();
 }
 
-void remove_cache_position(std::shared_ptr<ov::Model>& model) {
+void remove_cache_position(const std::shared_ptr<ov::Model>& model) {
     // Build subgraph that will replace cache_pos
     auto input_ids = model->input("input_ids").get_node();
     auto shape_of_node = std::make_shared<ov::op::v3::ShapeOf>(input_ids->outputs()[0]);
@@ -683,7 +683,7 @@ void remove_cache_position(std::shared_ptr<ov::Model>& model) {
     model->validate_nodes_and_infer_types();
 }
 
-void expose_runtime_states_as_inputs(std::shared_ptr<ov::Model>& model) {
+void expose_runtime_states_as_inputs(const std::shared_ptr<ov::Model>& model) {
     // Store Assign nodes to perform remove_sink later on
     ov::SinkVector assigns;
     // To add new Params to the model
@@ -734,7 +734,7 @@ void expose_runtime_states_as_inputs(std::shared_ptr<ov::Model>& model) {
     }
 }
 
-void normalize_input_key_value_names(std::shared_ptr<ov::Model>& model) {
+void normalize_input_key_value_names(const std::shared_ptr<ov::Model>& model) {
     ov::ResultVector new_results, old_results;
     for (const auto& in : model->inputs()) {
         if (in.get_any_name().find("decoder") == std::string::npos) {
@@ -750,7 +750,7 @@ void normalize_input_key_value_names(std::shared_ptr<ov::Model>& model) {
     model->validate_nodes_and_infer_types();
 }
 
-void normalize_output_key_value_names(std::shared_ptr<ov::Model>& model) {
+void normalize_output_key_value_names(const std::shared_ptr<ov::Model>& model) {
     ov::ResultVector new_results, old_results;
     for (const auto& out : model->outputs()) {
         if (out.get_any_name().find("decoder") == std::string::npos) {
@@ -791,7 +791,7 @@ void add_cache_position_input(std::shared_ptr<ov::Model> model) {
 }
 }  // namespace
 
-std::shared_ptr<ov::Model> ov::npuw::util::prepare_whisper_prefill_model(std::shared_ptr<ov::Model>& model,
+std::shared_ptr<ov::Model> ov::npuw::util::prepare_whisper_prefill_model(const std::shared_ptr<ov::Model>& model,
                                                                          const uint32_t& max_prompt_size,
                                                                          const uint32_t& lhs_seq_size) {
     // 2) Remove all non-runtime states from inputs (they empty on first iteration)
@@ -811,7 +811,7 @@ std::shared_ptr<ov::Model> ov::npuw::util::prepare_whisper_prefill_model(std::sh
     return model;
 }
 
-std::shared_ptr<ov::Model> ov::npuw::util::prepare_whisper_kvcache_model(std::shared_ptr<ov::Model>& model) {
+std::shared_ptr<ov::Model> ov::npuw::util::prepare_whisper_kvcache_model(const std::shared_ptr<ov::Model>& model) {
     // FIXME: normalization should be done inside stateful_to_stateless_transformation
     normalize_input_key_value_names(model);
     normalize_output_key_value_names(model);

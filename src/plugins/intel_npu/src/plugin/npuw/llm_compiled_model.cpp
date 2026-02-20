@@ -777,6 +777,7 @@ public:
         register_matcher(std::make_shared<opp::Matcher>(pattern, "ConvertTypeRelaxedToRegular"), callback);
     }
 };
+
 class Phi3SlidingMask : public ov::pass::ModelPass {
 public:
     OPENVINO_MODEL_PASS_RTTI("ov::npuw::LLMCompiledModel::Phi3SlidingMask");
@@ -910,6 +911,13 @@ void patch_phi3_sliding_mask(const std::shared_ptr<ov::Model>& model) {
     manager.run_passes(model);
 }
 
+const ov::AnyMap dyn_attn_opts = {
+    {"NPUW_ONLINE_PIPELINE", "REP"},
+    {"NPUW_ONLINE_ISOLATE", "ATTN"},
+    {"NPUW_ONLINE_KEEP_BLOCK_SIZE", "4"},
+    {"NPUW_UNFOLD_IREQS", "NO"},
+};
+
 }  // namespace
 
 class CutLMHead : public ov::pass::MatcherPass {
@@ -997,7 +1005,7 @@ public:
 };
 
 namespace {
-std::shared_ptr<ov::Model> cut_lm_head(std::shared_ptr<ov::Model>& model) {
+std::shared_ptr<ov::Model> cut_lm_head(const std::shared_ptr<ov::Model>& model) {
     ov::pass::GraphRewrite rewr;
     std::shared_ptr<ov::Model> lm_head_model = nullptr;
     rewr.add_matcher<CutLMHead>(lm_head_model);
@@ -1411,9 +1419,127 @@ void apply_moe_device_routed_transforms(std::vector<std::shared_ptr<ov::Model>>&
     LOG_INFO("DEVICE_ROUTED MoE transformations completed");
 }
 
+ov::element::Type choose_kv_cache_storage_type(const std::shared_ptr<ov::Model>& model, const ::intel_npu::Config& cfg, ov::AnyMap& other_props) {
+    auto kv_kache_storage_type = ov::element::f16;
+
+    // kv-cache-precision changes to fp8 does make sense unconditionally only if LPT passes succesfully applied
+    if (cfg.get<::intel_npu::NPUW_LLM_OPTIMIZE_FP8>()) {
+        kv_kache_storage_type = optimize_kv_cache_storage(model);
+    }
+
+    auto kv_cache_precision_hint = pop_option(other_props, ov::hint::kv_cache_precision.name());
+    // ov::kv_cache_precision hint can additionally change kv-cache precision, but it might lead to less accurate
+    // results
+    if (kv_cache_precision_hint.has_value()) {
+        auto suggested_kv_cache_precision = kv_cache_precision_hint.value().as<ov::element::Type>();
+        if (kv_kache_storage_type != suggested_kv_cache_precision) {
+            LOG_WARN("KV-cache precision HINT: " << suggested_kv_cache_precision << " applied");
+            kv_kache_storage_type = suggested_kv_cache_precision;
+        }
+    }
+
+    return kv_kache_storage_type;
+}
+
+std::tuple<bool, bool, bool, bool> detect_model_type(const std::shared_ptr<ov::Model>& model, ::intel_npu::Config& cfg, ov::AnyMap& other_props, ov::AnyMap& npuw_llm_props) {
+    auto use_whisper_key = pop_option(other_props, std::string("NPUW_WHISPER"));
+    auto use_eagle_key = pop_option(other_props, std::string("NPUW_EAGLE"));
+
+    auto is_whisper = use_whisper_key.value_or(false).as<bool>() == true;
+    if (is_whisper) {
+        cfg.update({{"NPUW_LLM_SHARED_HEAD", "NO"}});
+        cfg.update({{"NPUW_LLM_PREFILL_CHUNK_SIZE", "0"}});
+        cfg.update({{"NPUW_LLM_CACHE_ROPE", "NO"}});
+        cfg.update({{"NPUW_LLM_OPTIMIZE_V_TENSORS", "NO"}});
+    }
+
+    auto is_eagle = use_eagle_key.value_or(false).as<bool>() == true;
+    if (is_eagle) {
+        LOG_INFO("Eagle3 speculative decoding mode enabled");
+    }
+
+    auto use_text_embed_key = pop_option(other_props, std::string("NPUW_TEXT_EMBED"));
+    auto is_embedding = use_text_embed_key.value_or(false).as<bool>() == true;
+
+    // Auto-detect MoE model by scanning for router/expert nodes
+    const bool is_moe = is_moe_model(model);
+    if (is_moe) {
+        // Only apply MoE defaults if not explicitly set in external config
+        if (npuw_llm_props.find("NPUW_LLM_SHARED_HEAD") == npuw_llm_props.end()) {
+            cfg.update({{"NPUW_LLM_SHARED_HEAD", "NO"}});
+        }
+        if (npuw_llm_props.find("NPUW_LLM_GENERATE_HINT") == npuw_llm_props.end()) {
+            cfg.update({{"NPUW_LLM_GENERATE_HINT", "BEST_PERF"}});
+        }
+    }
+
+    return {is_whisper, is_eagle, is_moe, is_embedding};
+}
+
+uint32_t get_prefill_chunk_size(const ::intel_npu::Config& cfg, uint32_t max_prompt_len) {
+    // NB: PREFILL_HINT is now compatible with the PREFILL_CONFIG section, unlike for
+    // the generate model they're not mutually exclusive
+    const ::intel_npu::npuw::llm::PrefillHint prefill_hint = cfg.get<::intel_npu::NPUW_LLM_PREFILL_HINT>();
+    // uint64_t prefill_chunk_size = cfg.get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>();
+    uint32_t prefill_chunk_size = max_prompt_len;
+    bool use_chunk_prefill = prefill_hint == ::intel_npu::npuw::llm::PrefillHint::DYNAMIC;
+
+    // If chunk size covers the entire prompt, just follow the static behavior.
+    // Otherwise, use chunking and align the prompt size to the chunk size.
+    if (use_chunk_prefill) {
+        prefill_chunk_size = cfg.get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>();
+        if (prefill_chunk_size >= max_prompt_len) {
+            prefill_chunk_size = max_prompt_len;
+        } else {
+            const auto is_power_of_two = [](uint64_t n) {
+                return n > 0 && (n & (n - 1)) == 0;
+            };
+            if (!is_power_of_two(prefill_chunk_size)) {
+                OPENVINO_THROW("Configuration Error: chunk size (",
+                               prefill_chunk_size,
+                               ") is not power of 2. Please adjust NPUW_LLM_PREFILL_CHUNK_SIZE.");
+            }
+        }
+    }
+
+    return prefill_chunk_size;
+}
+
+uint32_t get_prefix_caching_max_num_blocks(const ::intel_npu::Config& cfg, bool use_chunk_prefill, uint32_t prefill_chunk_size) {
+    uint32_t prefix_caching_max_num_blocks = 0;
+    if (use_chunk_prefill) {
+        bool enable_prefix_caching = cfg.get<::intel_npu::NPUW_LLM_ENABLE_PREFIX_CACHING>();
+        if (enable_prefix_caching) {
+            LOG_INFO("Prefix caching is enabled");
+            enable_prefix_caching = cfg.get<::intel_npu::NPUW_LLM_PREFIX_CACHING_BLOCK_SIZE>();
+            if (!is_aligned_to(static_cast<uint32_t>(prefill_chunk_size),
+                                static_cast<uint32_t>(enable_prefix_caching))) {
+                LOG_INFO("Prefix caching block size is adjusted to " << prefill_chunk_size);
+                enable_prefix_caching = prefill_chunk_size;
+            }
+            prefix_caching_max_num_blocks = cfg.get<::intel_npu::NPUW_LLM_PREFIX_CACHING_MAX_NUM_BLOCKS>();
+            LOG_INFO("Prefix caching block size: " << enable_prefix_caching);
+            LOG_INFO("Prefix caching maximum number of blocks: " << prefix_caching_max_num_blocks);
+        }
+    }
+
+    return prefix_caching_max_num_blocks;
+}
+
+std::tuple<uint32_t, uint32_t, uint32_t> get_context_limits(const ::intel_npu::Config& cfg) {
+    uint32_t max_prompt_len = align_to(cfg.get<::intel_npu::NPUW_LLM_MAX_PROMPT_LEN>(), 64u);
+    const uint32_t min_response_len = align_to(cfg.get<::intel_npu::NPUW_LLM_MIN_RESPONSE_LEN>(), 64u);
+    uint32_t max_generation_token_len = cfg.get<::intel_npu::NPUW_LLM_MAX_GENERATION_TOKEN_LEN>();
+    if (max_generation_token_len != 1) {
+        max_generation_token_len = align_to(max_generation_token_len, 8u);
+    }
+
+    return {max_prompt_len, min_response_len, max_generation_token_len};
+}
+
 }  // namespace
 
-void ov::npuw::LLMCompiledModel::convert_stateful_lora_to_stateless(std::shared_ptr<ov::Model>& model) {
+void convert_stateful_lora_to_stateless(const std::shared_ptr<ov::Model>& model) {
     typedef std::shared_ptr<ov::op::util::AssignBase> PAssign;
     typedef std::shared_ptr<ov::op::util::ReadValueBase> PReadValue;
     std::vector<PReadValue> readValues;
@@ -1553,6 +1679,656 @@ void ov::npuw::LLMCompiledModel::compile_generate_model_variants(
     m_kvcache_compiled = m_generate_compiled_variants.back();
 }
 
+class DecomposeGQAPass : public ov::pass::ModelPass {
+    const bool m_is_prefill_model = false;
+
+public:
+    OPENVINO_MODEL_PASS_RTTI("npuw::DecomposeGQAPass");
+    /*
+     * Rope cache is NPUW  pass that removes sin/cos subgraph and replaces it with corresponding LUT/gather operations
+     */
+    explicit DecomposeGQAPass(const bool is_prefill_model) : m_is_prefill_model(is_prefill_model) {}
+    bool run_on_model(const std::shared_ptr<ov::Model>& m) override {
+        ov::pass::GraphRewrite rewr;
+        rewr.add_matcher<GroupQueryAttentionDecomposition>(m_is_prefill_model);
+        return rewr.run_on_model(m);
+    }
+};
+
+
+class ReshapeToStaticPass : public ov::pass::ModelPass {
+public:
+    struct Parameters {
+        uint32_t m_input_size = 0;
+        uint32_t m_kvcache_size = 0;
+        KVAxesPosition m_kv_axes_position = {0, 0};
+        uint32_t m_lora_rank = 0;
+        uint32_t m_whisper_lhs_seq_size = 0;
+    };
+
+    OPENVINO_MODEL_PASS_RTTI("npuw::ReshapeToStaticPass");
+    /*
+     * Rope cache is NPUW  pass that removes sin/cos subgraph and replaces it with corresponding LUT/gather operations
+     */
+    explicit ReshapeToStaticPass(const Parameters params) : m_parameters(params) {}
+
+    bool run_on_model(const std::shared_ptr<ov::Model>& m) override {
+        reshape_to_static(m,
+                          m_parameters.m_input_size,
+                          m_parameters.m_kvcache_size,
+                          m_parameters.m_kv_axes_position,
+                          m_parameters.m_lora_rank,
+                          m_parameters.m_whisper_lhs_seq_size);
+
+        return true;
+    }
+private:
+    Parameters m_parameters;
+};
+
+class OptimizeValueTensorsPass : public ov::pass::ModelPass {
+    bool m_is_prefill = false;
+
+public:
+    OPENVINO_MODEL_PASS_RTTI("npuw::OptimizeValueTensorsPass");
+    /*
+     * Rope cache is NPUW  pass that removes sin/cos subgraph and replaces it with corresponding LUT/gather operations
+     */
+    explicit OptimizeValueTensorsPass(bool is_prefill) : m_is_prefill(is_prefill) {}
+
+    bool run_on_model(const std::shared_ptr<ov::Model>& m) override {
+        return ov::npuw::util::optimize_value_tensors(m, m_is_prefill);
+    }
+};
+
+class RegularizeAttentionPass : public ov::pass::ModelPass {
+    bool m_do_attention_broadcast = false;
+public:
+    OPENVINO_MODEL_PASS_RTTI("npuw::RegularizeAttentionPass");
+    /*
+     * Rope cache is NPUW  pass that removes sin/cos subgraph and replaces it with corresponding LUT/gather operations
+     */
+    explicit RegularizeAttentionPass(bool do_attention_broadcast) : m_do_attention_broadcast(do_attention_broadcast) {}
+
+    bool run_on_model(const std::shared_ptr<ov::Model>& m) override {
+        // Regularize models for the better partitioning assuming it is a transformer
+        bool result = false;
+        if (m_do_attention_broadcast) {
+            ov::pass::GraphRewrite rewr;
+            rewr.add_matcher<ov::npuw::patterns::regularize::AttentionBroadcast>();
+            rewr.add_matcher<ov::npuw::patterns::regularize::AttentionBroadcast2>();
+
+            result |= rewr.run_on_model(m);
+        }
+
+        // FIXME: generally all these patterns are supposed to improve the partitioning - thus
+        // the performance. However, ShapeOfParameter seems to be working fine for all known case,
+        // while AttentionBroadcast patterns might break the partitioning (related to F16IC).
+        ov::pass::GraphRewrite rewr2;
+        rewr2.add_matcher<ov::npuw::patterns::regularize::ShapeOfParameter>();
+        result |= rewr2.run_on_model(m);
+
+        return result;
+    }
+};
+
+class LoraStatefulToStatelessPass : public ov::pass::ModelPass {
+public:
+    OPENVINO_MODEL_PASS_RTTI("npuw::LoraStatefulToStatelessPass");
+    /*
+     * Rope cache is NPUW  pass that removes sin/cos subgraph and replaces it with corresponding LUT/gather operations
+     */
+    explicit LoraStatefulToStatelessPass() {}
+    bool run_on_model(const std::shared_ptr<ov::Model>& m) override {
+        LOG_DEBUG("Convert stateful lora to stateless");
+        convert_stateful_lora_to_stateless(m);
+
+        return true;
+    }
+};
+
+class PrepareWhisperModelPass : public ov::pass::ModelPass {
+    bool m_is_prefill = false;
+    uint32_t m_max_prompt_len = 1;
+public:
+    OPENVINO_MODEL_PASS_RTTI("npuw::PrepareWhisperModelPass");
+    /*
+     * Rope cache is NPUW  pass that removes sin/cos subgraph and replaces it with corresponding LUT/gather operations
+     */
+    explicit PrepareWhisperModelPass(bool is_prefill, uint32_t max_prompt_len = 1) : m_is_prefill(is_prefill), m_max_prompt_len(max_prompt_len) {}
+    bool run_on_model(const std::shared_ptr<ov::Model>& m) override {
+        LOG_DEBUG("Running whisper model transformations");
+        if (m_is_prefill) {
+            auto whisper_lhs_seq_size =
+                static_cast<uint32_t>(m->input("encoder_hidden_states").get_partial_shape()[1].get_length());
+            ov::npuw::util::prepare_whisper_prefill_model(m,
+                                                          m_max_prompt_len,
+                                                          whisper_lhs_seq_size);  // Whisper decoder model
+        } else {
+            ov::npuw::util::prepare_whisper_kvcache_model(m); // Whisper decoder_with_past model
+        }
+
+        return true;
+    }
+};
+
+class MoEDeviceRoutedTransforms : public ov::pass::ModelPass {
+public:
+    OPENVINO_MODEL_PASS_RTTI("npuw::MoEDeviceRoutedTransforms");
+    /*
+     * Rope cache is NPUW  pass that removes sin/cos subgraph and replaces it with corresponding LUT/gather operations
+     */
+    explicit MoEDeviceRoutedTransforms() {}
+    bool run_on_model(const std::shared_ptr<ov::Model>& m) override {
+        LOG_INFO("Applying DEVICE_ROUTED MoE transformations...");
+        ov::npuw::pass::DeviceRoutedMoETransform().run_on_model(m);
+        LOG_DEBUG("  Applied DEVICE_ROUTED transformations to model variant");
+
+        // Apply Gather to 2D Gather transformation for HW optimization
+        ov::npuw::pass::GatherTo2DGather().run_on_model(m);
+        LOG_DEBUG("  Applied GatherTo2DGather transformation to model variant");
+        LOG_INFO("DEVICE_ROUTED MoE transformations completed");
+        return true;
+    }
+};
+
+std::shared_ptr<ov::Model> check_and_cut_lm_head(const std::shared_ptr<ov::Model>& m, const ::intel_npu::Config& cfg) {
+    bool shared_head_enabled = cfg.get<::intel_npu::NPUW_LLM_SHARED_HEAD>();
+    std::shared_ptr<ov::Model> lm_head_model = nullptr;
+    if (shared_head_enabled) {
+        LOG_DEBUG("Trying to separate Vocabulary matrix multiplication op into additional model...");
+        lm_head_model = cut_lm_head(m);
+        if (lm_head_model) {
+            LOG_INFO("Three-model pipeline will be created: LM head will be shared between prefill and generate.");
+        } else {
+            LOG_WARN("Three-model pipeline is requested, but LM head cutting is failed,"
+                     " two-model pipeline will be created!");
+        }
+    } else {
+        LOG_INFO("Two-model pipeline will be created.");
+    }
+
+    return lm_head_model;
+}
+
+std::shared_ptr<ov::Model> run_common_prolog_transformations(const std::shared_ptr<ov::Model>& m, const ::intel_npu::Config& cfg, bool is_embedding, bool is_whisper) {
+    const uint32_t seq_len_dim = cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
+    if (is_embedding) {
+        LOG_DEBUG("Text-embedding model rebuild");
+        ov::npuw::util::prepare_text_embedding_model(m, seq_len_dim);
+    } else {
+        LOG_DEBUG("Transform kvcache model from stateful to stateless.");
+        ov::pass::StatefulToStateless().run_on_model(m);
+    }
+    LoraStatefulToStatelessPass().run_on_model(m);
+    LOG_DEBUG("   ...also convert BF16 to FP16");
+    ov::pass::ConvertPrecision(ov::element::bf16, ov::element::f16).run_on_model(m);
+
+    auto lm_head_model = check_and_cut_lm_head(m, cfg);
+
+    if (!is_whisper) {
+        LOG_DEBUG("Try patch Phi-3 sliding window mask, if it exists.");
+        patch_phi3_sliding_mask(m);
+    }
+
+    return lm_head_model;
+}
+
+std::shared_ptr<ov::Model> common_transformations(
+        const std::shared_ptr<ov::Model>& m,
+        const ::intel_npu::Config& cfg,
+        uint32_t max_generation_token_len,
+        uint32_t max_prompt_len,
+        uint32_t batch_dim_id,
+        ov::element::Type kv_cache_storage_type,
+        bool is_prefill,
+        bool is_embedding,
+        bool is_moe,
+        bool slice_out_embeds_flag,
+        bool use_chunk_prefill,
+        intel_npu::npuw::llm::AttentionHint attn_hint,
+        bool& out_transpose_v_tensors) {
+
+    const std::string model_stage = is_prefill ? "prefill" : "generate";
+    if (slice_out_embeds_flag) {
+        LOG_DEBUG("Shared LM head: slice the output");
+        slice_out_embeds(m, batch_dim_id, max_generation_token_len);
+    }
+
+    LOG_DEBUG("5.1, decompose GroupQueryAttention OP");
+    DecomposeGQAPass(is_prefill).run_on_model(m);
+
+    const bool prefill_attn_dyn = attn_hint == ::intel_npu::npuw::llm::AttentionHint::DYNAMIC;
+    const bool prefill_attn_pyramid = attn_hint == ::intel_npu::npuw::llm::AttentionHint::PYRAMID;
+    const bool prefill_attn_hfa = attn_hint == ::intel_npu::npuw::llm::AttentionHint::HFA;
+
+    const bool optimize_v_tensors = cfg.get<::intel_npu::NPUW_LLM_OPTIMIZE_V_TENSORS>();
+    if (optimize_v_tensors && !prefill_attn_dyn) {
+        LOG_DEBUG("Check and apply opt layout");
+        if (OptimizeValueTensorsPass(is_prefill).run_on_model(m)) {
+            LOG_DEBUG("V-tensors tranposed in " + model_stage + " model");
+            out_transpose_v_tensors = true;
+        }
+    }
+    else{
+        LOG_DEBUG("Check and apply opt layout --- SKIPPED");
+    }
+
+    if (!is_embedding) {
+        if (is_prefill && !use_chunk_prefill) {
+            // TODO: sometimes it is ok if we cannot find any empty inputs or not?
+            NPUW_ASSERT(remove_empty_kv_inputs(m));
+        } else {
+            LOG_DEBUG("Don't remove input key/values from prefill model.");
+            LOG_DEBUG("Ask prefill model to output key/values for prefill chunk size tokens.");
+            redirect_new_kv_to_output(m);
+        }
+    }
+
+    LOG_DEBUG("Converting KV-cache in" + model_stage + "model to FP16.");
+    auto lp_model = cvt_kvcache_to_low_precision(m, kv_cache_storage_type);
+
+    if (!is_prefill && is_moe) {
+        const auto generate_moe_hint = cfg.get<::intel_npu::NPUW_LLM_GENERATE_MOE_HINT>();
+        if (generate_moe_hint == ::intel_npu::npuw::llm::MoEHint::DEVICE_ROUTED) {
+            MoEDeviceRoutedTransforms().run_on_model(lp_model);
+        }
+    }
+
+    const ::intel_npu::npuw::llm::GenerateHint generate_hint = cfg.get<::intel_npu::NPUW_LLM_GENERATE_HINT>();
+    if (cfg.get<::intel_npu::NPUW_LLM_CACHE_ROPE>()) {
+        LOG_DEBUG("Caching preROPE ");
+        const uint32_t CACHE_ROPE_START = 2048;
+        const bool is_best = (generate_hint == ::intel_npu::npuw::llm::GenerateHint::BEST_PERF);
+
+        if (!is_best || (max_prompt_len >= CACHE_ROPE_START)) {
+            LOG_DEBUG("Enable RoPE Cache for prefill");
+            ov::npuw::patterns::pre_compute::RopeCache rope_prefill_cacher(max_prompt_len);
+            rope_prefill_cacher.run_on_model(lp_model);
+        }
+    }
+
+    RegularizeAttentionPass(prefill_attn_dyn || prefill_attn_pyramid || prefill_attn_hfa).run_on_model(lp_model);
+
+    return lp_model;
+}
+
+ov::AnyMap make_generate_config(
+        const std::shared_ptr<const ov::IPlugin>& plugin,
+        const ::intel_npu::Config& cfg,
+        const std::optional<ov::Any>& generate_config_opt,
+        const std::optional<ov::Any>& generate_config_addition,
+        const ov::AnyMap& npuw_llm_props,
+        const ov::AnyMap& other_props,
+        bool is_moe,
+        std::string weights_bank_name) {
+    const auto generate_attn_hint = cfg.get<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>();
+    const bool generate_attn_dyn = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::DYNAMIC;
+    const bool generate_attn_pyramid = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::PYRAMID;
+    const bool generate_attn_hfa = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::HFA;
+
+    // NB: GENERATE_HINT is only applicable for default generate config!
+    if (generate_config_opt.has_value() && npuw_llm_props.count(ov::intel_npu::npuw::llm::generate_hint.name())) {
+        OPENVINO_THROW("GENERATE_HINT only works with default generate config!");
+    }
+
+    const ::intel_npu::npuw::llm::GenerateHint generate_hint = cfg.get<::intel_npu::NPUW_LLM_GENERATE_HINT>();
+    const auto npudesc = extract_npu_descriptor(plugin);
+    auto generate_config =
+        generate_config_opt.value_or(get_default_generate_config(npudesc, generate_hint)).as<ov::AnyMap>();
+
+    auto generate_config_addition_value =
+        generate_config_addition.has_value() ? generate_config_addition.value().as<ov::AnyMap>() : ov::AnyMap{};
+
+    merge_config_with(generate_config, other_props);
+    merge_config_with(generate_config, generate_config_addition_value);
+
+    // Convert LLM-specific attention hints to NPUW_ATTN
+    if (auto attn_hint_it = npuw_llm_props.find("NPUW_LLM_GENERATE_ATTENTION_HINT"); attn_hint_it != npuw_llm_props.end()) {
+        generate_config["NPUW_ATTN"] = attn_hint_it->second;
+    }
+
+    // Generate a random weights bank name unique to this LLMCompiledModel object
+    apply_weights_bank_name(generate_config, weights_bank_name);
+
+    // Handle attention hints. FIXME: Maybe it makes sense to make those
+    // mutually exclusive with the precise configuration sections as well
+    if (generate_attn_dyn || generate_attn_pyramid || generate_attn_hfa) {
+        merge_config_with(generate_config, dyn_attn_opts);
+    }
+
+    if (is_moe) {
+        // Apply MoE configuration for generate stage
+        const auto generate_moe_hint = cfg.get<::intel_npu::NPUW_LLM_GENERATE_MOE_HINT>();
+        apply_moe_config(generate_config, generate_moe_hint, "GENERATE");
+    }
+
+    // Note: with dynamic attention in EITHER STAGE, we have to
+    // explicitly disable the run-time fallback to so extra ov::Model
+    // references won't be held by the npuw::CompiledModel, resulting
+    // in a higher memory consumption. This behavior should be reworked!
+    // The reason here is that NPUW_DEVICES may come as a global setting,
+    // impacting all the stages.
+    const auto attn_hint = cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
+    const bool attn_dyn = attn_hint == ::intel_npu::npuw::llm::AttentionHint::DYNAMIC;
+    if (attn_dyn || generate_attn_dyn) {
+        const ov::AnyMap no_runtime_fallback = {{"NPUW_FALLBACK_EXEC", "NO"}};
+        merge_config_with(generate_config, no_runtime_fallback);
+    }
+
+    return generate_config;
+}
+
+std::vector<std::shared_ptr<ov::Model>> ov::npuw::LLMCompiledModel::run_generate_transformations(
+        std::shared_ptr<ov::Model>& kvcache_model,
+        uint32_t max_prompt_len,
+        uint32_t min_response_len,
+        uint32_t max_generation_token_len,
+        ov::element::Type kv_cache_storage_type,
+        bool is_moe) {
+    LOG_DEBUG("Running transformations on kvcache model...");
+    const uint32_t batch_dim = m_cfg.get<::intel_npu::NPUW_LLM_BATCH_DIM>();
+    const uint32_t seq_len_dim = m_cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
+    KVAxesPosition axes{batch_dim, seq_len_dim};
+
+    uint32_t whisper_lhs_seq_size = 0;  // Not applicable for LLMs/VLMs
+    if (m_is_whisper) {
+        whisper_lhs_seq_size =
+            static_cast<uint32_t>(kvcache_model->input("encoder_hidden_states").get_partial_shape()[1].get_length());
+        PrepareWhisperModelPass(false).run_on_model(kvcache_model);
+    }
+
+    LOG_DEBUG("Make kvcache model with static shapes");
+
+    // Create generate model variants with different sizes
+    auto generate_model_variants = create_generate_model_variants(kvcache_model, axes, whisper_lhs_seq_size);
+
+    std::vector<std::shared_ptr<ov::Model>> resulting_models;
+    resulting_models.reserve(generate_model_variants.size());
+
+    const auto generate_attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>();
+    uint32_t optimized_count = 0;
+    for (auto& model_variant : generate_model_variants) {
+        bool transpose_v_tensors = false;
+        auto transformed_model = common_transformations(model_variant, m_cfg, max_generation_token_len, max_prompt_len, axes.batch,
+            kv_cache_storage_type, false, m_is_embedding, is_moe, false, false, generate_attn_hint, transpose_v_tensors);
+        optimized_count += transpose_v_tensors;
+
+        resulting_models.push_back(transformed_model);
+    }
+
+    if (optimized_count == generate_model_variants.size()) {
+        LOG_DEBUG("V-tensors transposed in generate model variants");
+        m_kvcache_desc.v_tensors_transposed_gen = true;
+    } else if (optimized_count == 0) {
+        LOG_DEBUG("No V-tensors were optimized");
+        m_kvcache_desc.v_tensors_transposed_gen = false;
+    } else {
+        // Partial optimization is not allowed
+        OPENVINO_ASSERT(false,
+                        "Partial optimization detected: ",
+                        optimized_count,
+                        " out of ",
+                        generate_model_variants.size(),
+                        " variants were optimized, which is not allowed.");
+    }
+
+    LOG_DEBUG("Transformations on kvcache model done");
+
+    return resulting_models;
+}
+
+ov::AnyMap make_prefill_config(
+        const std::shared_ptr<const ov::IPlugin>& plugin,
+        const std::shared_ptr<ov::Model>& prefill_model,
+        const ::intel_npu::Config& cfg,
+        const std::optional<ov::Any>& prefill_config_opt,
+        const std::optional<ov::Any>& prefill_config_addition,
+        const ov::AnyMap& npuw_llm_props,
+        const ov::AnyMap& other_props,
+        bool is_whisper,
+        bool is_embedding,
+        bool is_moe,
+        std::string weights_bank_name) {
+    const auto attn_hint = cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
+    const bool attn_dyn = attn_hint == ::intel_npu::npuw::llm::AttentionHint::DYNAMIC;
+    const bool attn_pyramid = attn_hint == ::intel_npu::npuw::llm::AttentionHint::PYRAMID;
+    const bool attn_hfa = attn_hint == ::intel_npu::npuw::llm::AttentionHint::HFA;
+
+    const auto npudesc = extract_npu_descriptor(plugin);
+    auto prefill_config =
+        prefill_config_opt.value_or(get_default_prefill_config(prefill_model, npudesc)).as<ov::AnyMap>();
+
+    auto prefill_config_addition_value =
+        prefill_config_addition.has_value() ? prefill_config_addition.value().as<ov::AnyMap>() : ov::AnyMap{};
+
+    merge_config_with(prefill_config, other_props);
+    merge_config_with(prefill_config, prefill_config_addition_value);
+
+    // Convert LLM-specific attention hints to NPUW_ATTN
+    if (auto attn_hint_it = npuw_llm_props.find("NPUW_LLM_PREFILL_ATTENTION_HINT"); attn_hint_it != npuw_llm_props.end()) {
+        prefill_config["NPUW_ATTN"] = attn_hint_it->second;
+    }
+
+    apply_weights_bank_name(prefill_config, weights_bank_name);
+
+    // Handle attention hints. FIXME: Maybe it makes sense to make those
+    // mutually exclusive with the precise configuration sections as well
+    if (attn_dyn || attn_pyramid || attn_hfa) {
+        merge_config_with(prefill_config, dyn_attn_opts);
+    }
+
+    if (is_moe) {
+        // Apply MoE configuration for prefill stage
+        const auto prefill_moe_hint = cfg.get<::intel_npu::NPUW_LLM_PREFILL_MOE_HINT>();
+        apply_moe_config(prefill_config, prefill_moe_hint, "PREFILL");
+    }
+
+    // Note: with dynamic attention in EITHER STAGE, we have to
+    // explicitly disable the run-time fallback to so extra ov::Model
+    // references won't be held by the npuw::CompiledModel, resulting
+    // in a higher memory consumption. This behavior should be reworked!
+    // The reason here is that NPUW_DEVICES may come as a global setting,
+    // impacting all the stages.
+    const auto generate_attn_hint = cfg.get<::intel_npu::NPUW_LLM_GENERATE_ATTENTION_HINT>();
+    const bool generate_attn_dyn = generate_attn_hint == ::intel_npu::npuw::llm::AttentionHint::DYNAMIC;
+    if (attn_dyn || generate_attn_dyn) {
+        const ov::AnyMap no_runtime_fallback = {{"NPUW_FALLBACK_EXEC", "NO"}};
+        merge_config_with(prefill_config, no_runtime_fallback);
+    }
+
+    if (is_whisper) {
+        update_config_for_whisper(prefill_config);
+    }
+
+    if (is_embedding) {
+        update_config_for_text_embed(prefill_config);
+    }
+
+    return prefill_config;
+}
+
+std::shared_ptr<ov::Model> ov::npuw::LLMCompiledModel::run_prefill_transformations(
+        std::shared_ptr<ov::Model>& prefill_model,
+        uint32_t max_prompt_len,
+        uint32_t min_response_len,
+        uint32_t max_generation_token_len,
+        ov::element::Type kv_cache_storage_type,
+        bool slice_out_embeds_flag,
+        bool is_moe) {
+    const uint32_t batch_dim = m_cfg.get<::intel_npu::NPUW_LLM_BATCH_DIM>();
+    const uint32_t seq_len_dim = m_cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
+    KVAxesPosition axes{batch_dim, seq_len_dim};
+
+    uint32_t whisper_lhs_seq_size = 0;  // Not applicable for LLMs/VLMs
+    if (m_is_whisper) {
+        whisper_lhs_seq_size =
+            static_cast<uint32_t>(prefill_model->input("encoder_hidden_states").get_partial_shape()[1].get_length());
+
+        axes = KVAxesPosition{whisper_batch_dim, whisper_seq_len_dim};
+        PrepareWhisperModelPass(true, max_prompt_len).run_on_model(prefill_model);
+    }
+
+    m_max_lora_rank = m_cfg.get<::intel_npu::NPUW_LLM_MAX_LORA_RANK>();
+
+    ReshapeToStaticPass::Parameters reshape_params{m_kvcache_desc.max_prompt_size, m_kvcache_desc.max_prompt_size, axes, m_max_lora_rank, whisper_lhs_seq_size};
+
+    if (m_use_chunk_prefill) {
+        reshape_params.m_input_size = m_prefill_chunk_size;
+        reshape_params.m_whisper_lhs_seq_size = 0;
+    }
+
+    ReshapeToStaticPass(reshape_params).run_on_model(prefill_model);
+
+    const auto attn_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_ATTENTION_HINT>();
+    bool transpose_v_tensor = false;
+    prefill_model = common_transformations(
+        prefill_model, m_cfg, max_generation_token_len, m_kvcache_desc.max_prompt_size, axes.batch,
+        kv_cache_storage_type, true, m_is_embedding, is_moe, slice_out_embeds_flag, m_use_chunk_prefill,
+        attn_hint, transpose_v_tensor);
+
+    m_kvcache_desc.v_tensors_transposed_pre = transpose_v_tensor;
+
+    return prefill_model;
+}
+
+ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& model,
+                                             const std::shared_ptr<const ov::IPlugin>& plugin,
+                                             const ov::AnyMap& properties)
+    : ov::npuw::ICompiledModel(model, plugin),
+      m_name(model->get_friendly_name()),
+      m_options_desc(std::make_shared<::intel_npu::OptionsDesc>()),
+      m_cfg(m_options_desc) {
+    LOG_DEBUG("Creating LLMCompiledModel");
+    LOG_BLOCK();
+
+    ::intel_npu::registerNPUWLLMOptions(*m_options_desc);
+
+    const auto npudesc = extract_npu_descriptor(plugin);
+
+    ov::AnyMap npuw_llm_props;
+    ov::AnyMap other_props;
+    split_llm_properties(properties, npuw_llm_props, other_props);
+
+    // Remove "NPUW_LLM_PREFILL_CONFIG", "NPUW_LLM_GENERATE_CONFIG" from map,
+    // to not pass them into ::intel_npu::Config object, as we don't need to
+    // preserve them somewhere.
+    auto prefill_config_opt = pop_option(npuw_llm_props, std::string("NPUW_LLM_PREFILL_CONFIG"));
+    auto generate_config_opt = pop_option(npuw_llm_props, std::string("NPUW_LLM_GENERATE_CONFIG"));
+    auto prefill_config_addition = pop_option(npuw_llm_props, std::string("++NPUW_LLM_PREFILL_CONFIG"));
+    auto generate_config_addition = pop_option(npuw_llm_props, std::string("++NPUW_LLM_GENERATE_CONFIG"));
+    // Also make these maps for third: lm head model, in case it will be created:
+    auto lm_head_config_opt = pop_option(npuw_llm_props, std::string("NPUW_LLM_SHARED_HEAD_CONFIG"));
+    auto lm_head_config_addition = pop_option(npuw_llm_props, std::string("++NPUW_LLM_SHARED_HEAD_CONFIG"));
+    refine_dynamic_props(npuw_llm_props, npudesc);
+    m_cfg.update(any_copy(npuw_llm_props));
+
+    auto kv_kache_storage_type = choose_kv_cache_storage_type(model, m_cfg, other_props);
+
+    bool is_moe = false;
+    std::tie(m_is_whisper, m_is_eagle, is_moe, m_is_embedding) = detect_model_type(model, m_cfg, other_props, npuw_llm_props);
+
+    // Solely used for serialization at the moment
+    m_non_llm_props = other_props;
+
+    auto [max_prompt_len, min_response_len, max_generation_token_len] = get_context_limits(m_cfg);
+
+    m_prefill_chunk_size = get_prefill_chunk_size(m_cfg, max_prompt_len);
+    m_use_chunk_prefill = max_prompt_len > m_prefill_chunk_size;
+    max_prompt_len = align_to(max_prompt_len, static_cast<uint32_t>(m_prefill_chunk_size));
+
+    m_prefix_caching_max_num_blocks = get_prefix_caching_max_num_blocks(m_cfg, m_use_chunk_prefill, m_prefill_chunk_size);
+    m_enable_prefix_caching = m_prefix_caching_max_num_blocks > 0;
+
+    OPENVINO_ASSERT(
+        !m_use_chunk_prefill || !ov::npuw::util::has_input(model, "token_type_ids") || !ov::npuw::util::has_input(model, "inputs_embeds"),
+        "Chunking is not implemented for Gemma model family yet. "
+        "Please set NPUW_LLM_PREFILL_HINT to 'STATIC'");
+
+    LOG_VERB("Enabled prefill chunking: " << m_use_chunk_prefill);
+    LOG_VERB("Prefill chunk size: " << m_prefill_chunk_size);
+    LOG_VERB("Maximum prompt length: " << max_prompt_len);
+
+    // Note: we need to identify original bf16 constants for potential weightless deserialization later
+    // And only then do bf16 to f16 transformation
+    m_bf16_consts = ov::npuw::s11n::get_bf16_consts(model);
+    auto weights_bank_name = ov::npuw::util::generate_random_string();
+    LOG_VERB("Generated a unique weights bank name: " << weights_bank_name);
+
+    LOG_DEBUG("Creating clone of passed model.");
+    auto model_clone = model->clone();
+
+    auto lm_head_model = run_common_prolog_transformations(model_clone, m_cfg, m_is_embedding, m_is_whisper);
+
+    LOG_DEBUG("Model clone is now kvcache_model.");
+    auto kvcache_model = model_clone;
+
+    LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
+    auto prefill_model = kvcache_model->clone();
+    prefill_model->set_friendly_name(kvcache_model->get_friendly_name() + "_prefill");
+
+    const uint32_t seq_len_dim = m_cfg.get<::intel_npu::NPUW_LLM_SEQ_LEN_DIM>();
+    m_kvcache_desc =
+        KVCacheDesc{max_prompt_len, max_prompt_len + min_response_len, 0u, seq_len_dim, max_generation_token_len};
+
+    if (m_is_whisper) {
+        m_kvcache_desc = KVCacheDesc{whisper_max_prompt_size, whisper_kvcache_size, 0u, whisper_seq_len_dim, 1u};
+    }
+
+    {
+        // Run generate section
+        auto generate_model_variants = run_generate_transformations(
+            kvcache_model, max_prompt_len, min_response_len, max_generation_token_len,
+            kv_kache_storage_type, is_moe);
+
+        auto generate_config = make_generate_config(
+            plugin, m_cfg, generate_config_opt,
+            generate_config_addition, npuw_llm_props, other_props,
+            is_moe, weights_bank_name);
+
+        // Compile multiple generate model variants with different sizes
+        compile_generate_model_variants(generate_model_variants, plugin, generate_config);
+    }
+
+    {
+        // Run prefill section
+        prefill_model = run_prefill_transformations(prefill_model, max_prompt_len, min_response_len, max_generation_token_len,
+            kv_kache_storage_type, lm_head_model != nullptr, is_moe);
+
+        auto prefill_config = make_prefill_config(
+            plugin, prefill_model, m_cfg, prefill_config_opt,
+            prefill_config_addition, npuw_llm_props, other_props,
+            m_is_whisper, m_is_embedding, is_moe, weights_bank_name);
+
+        m_prefill_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
+            ov::npuw::ICompiledModel::create(prefill_model, plugin, prefill_config));
+        NPUW_ASSERT(m_prefill_compiled && "Can't create ov::npuw::CompiledModel for passed prefill "
+                                        "model and its config, please check passed config.");
+    }
+
+    if (lm_head_model) {
+        // LM head section
+        auto lm_head_config = get_default_lm_head_config(npudesc);
+        merge_config_with(lm_head_config, other_props);
+        auto lm_head_config_addition_value = lm_head_config_addition.value_or(ov::AnyMap{}).as<ov::AnyMap>();
+        merge_config_with(lm_head_config, lm_head_config_addition_value);
+
+        apply_weights_bank_name(lm_head_config, weights_bank_name);
+
+        const uint32_t batch_dim = m_cfg.get<::intel_npu::NPUW_LLM_BATCH_DIM>();
+        reshape_sliced_head_to_static(lm_head_model, batch_dim, m_kvcache_desc.max_generation_token_len);
+
+        m_lm_head_compiled = std::dynamic_pointer_cast<ov::npuw::CompiledModel>(
+            ov::npuw::ICompiledModel::create(lm_head_model, plugin, lm_head_config));
+        NPUW_ASSERT(m_lm_head_compiled);
+    }
+
+    implement_properties();
+
+    LOG_DEBUG("Done");
+}
+
+/*
 ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& model,
                                              const std::shared_ptr<const ov::IPlugin>& plugin,
                                              const ov::AnyMap& properties)
@@ -1590,24 +2366,12 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     refine_dynamic_props(npuw_llm_props, npudesc);
     m_cfg.update(any_copy(npuw_llm_props));
 
-    auto kv_kache_storage_type = ov::element::f16;
+    auto kv_kache_storage_type = choose_kv_cache_storage_type(model, m_cfg, other_props);
 
-    // kv-cache-precision changes to fp8 does make sense unconditionally only if LPT passes succesfully applied
-    if (m_cfg.get<::intel_npu::NPUW_LLM_OPTIMIZE_FP8>()) {
-        kv_kache_storage_type = optimize_kv_cache_storage(model);
-    }
+    bool is_moe = false;
+    std::tie(m_is_whisper, m_is_eagle, is_moe, m_is_embedding) = detect_model_type(model, m_cfg, other_props, npuw_llm_props);
 
-    // ov::kv_cache_precision hint can additionally change kv-cache precision, but it might lead to less accurate
-    // results
-    if (kv_cache_precision_hint.has_value()) {
-        auto suggested_kv_cache_precision = kv_cache_precision_hint.value().as<ov::element::Type>();
-        if (kv_kache_storage_type != suggested_kv_cache_precision) {
-            LOG_WARN("KV-cache precision HINT: " << suggested_kv_cache_precision << " applied");
-            kv_kache_storage_type = suggested_kv_cache_precision;
-        }
-    }
-
-    m_is_whisper = use_whisper_key.value_or(false).as<bool>() == true;
+    // m_is_whisper = use_whisper_key.value_or(false).as<bool>() == true;
     if (m_is_whisper) {
         m_cfg.update({{"NPUW_LLM_SHARED_HEAD", "NO"}});
         m_cfg.update({{"NPUW_LLM_PREFILL_CHUNK_SIZE", "0"}});
@@ -1615,13 +2379,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         m_cfg.update({{"NPUW_LLM_OPTIMIZE_V_TENSORS", "NO"}});
     }
 
-    m_is_eagle = use_eagle_key.value_or(false).as<bool>() == true;
+    // m_is_eagle = use_eagle_key.value_or(false).as<bool>() == true;
     if (m_is_eagle) {
         LOG_INFO("Eagle3 speculative decoding mode enabled");
     }
 
     // Auto-detect MoE model by scanning for router/expert nodes
-    const bool is_moe = is_moe_model(model);
+    // const bool is_moe = is_moe_model(model);
     if (is_moe) {
         // Only apply MoE defaults if not explicitly set in external config
         if (npuw_llm_props.find("NPUW_LLM_SHARED_HEAD") == npuw_llm_props.end()) {
@@ -1634,53 +2398,61 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     // NB: PREFILL_HINT is now compatible with the PREFILL_CONFIG section, unlike for
     // the generate model they're not mutually exclusive
-    const ::intel_npu::npuw::llm::PrefillHint prefill_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_HINT>();
-    m_prefill_chunk_size = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>();
-    m_use_chunk_prefill = (prefill_hint == ::intel_npu::npuw::llm::PrefillHint::DYNAMIC && m_prefill_chunk_size > 0);
+    // const ::intel_npu::npuw::llm::PrefillHint prefill_hint = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_HINT>();
+    // m_prefill_chunk_size = m_cfg.get<::intel_npu::NPUW_LLM_PREFILL_CHUNK_SIZE>();
+    // m_use_chunk_prefill = (prefill_hint == ::intel_npu::npuw::llm::PrefillHint::DYNAMIC && m_prefill_chunk_size > 0);
 
-    uint32_t max_prompt_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MAX_PROMPT_LEN>(), 64u);
-    const uint32_t min_response_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MIN_RESPONSE_LEN>(), 64u);
-    uint32_t max_generation_token_len = m_cfg.get<::intel_npu::NPUW_LLM_MAX_GENERATION_TOKEN_LEN>();
-    if (max_generation_token_len != 1) {
-        max_generation_token_len = align_to(max_generation_token_len, 8u);
-    }
+    // uint32_t max_prompt_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MAX_PROMPT_LEN>(), 64u);
+    // const uint32_t min_response_len = align_to(m_cfg.get<::intel_npu::NPUW_LLM_MIN_RESPONSE_LEN>(), 64u);
+    // uint32_t max_generation_token_len = m_cfg.get<::intel_npu::NPUW_LLM_MAX_GENERATION_TOKEN_LEN>();
+    // if (max_generation_token_len != 1) {
+    //     max_generation_token_len = align_to(max_generation_token_len, 8u);
+    // }
 
     // If chunk size covers the entire prompt, just follow the static behavior.
     // Otherwise, use chunking and align the prompt size to the chunk size.
-    if (m_use_chunk_prefill) {
-        OPENVINO_ASSERT(
-            !ov::npuw::util::has_input(model, "token_type_ids") || !ov::npuw::util::has_input(model, "inputs_embeds"),
-            "Chunking is not implemented for Gemma model family yet. "
-            "Please set NPUW_LLM_PREFILL_HINT to 'STATIC'");
-        if (m_prefill_chunk_size >= max_prompt_len) {
-            m_use_chunk_prefill = false;
-        } else {
-            const auto is_power_of_two = [](uint64_t n) {
-                return n > 0 && (n & (n - 1)) == 0;
-            };
-            if (!is_power_of_two(m_prefill_chunk_size)) {
-                OPENVINO_THROW("Configuration Error: chunk size (",
-                               m_prefill_chunk_size,
-                               ") is not power of 2. Please adjust NPUW_LLM_PREFILL_CHUNK_SIZE.");
-            }
-            max_prompt_len = align_to(max_prompt_len, static_cast<uint32_t>(m_prefill_chunk_size));
-        }
+    // if (m_use_chunk_prefill) {
+    //     OPENVINO_ASSERT(
+    //         !ov::npuw::util::has_input(model, "token_type_ids") || !ov::npuw::util::has_input(model, "inputs_embeds"),
+    //         "Chunking is not implemented for Gemma model family yet. "
+    //         "Please set NPUW_LLM_PREFILL_HINT to 'STATIC'");
+    //     if (m_prefill_chunk_size >= max_prompt_len) {
+    //         m_use_chunk_prefill = false;
+    //     } else {
+    //         const auto is_power_of_two = [](uint64_t n) {
+    //             return n > 0 && (n & (n - 1)) == 0;
+    //         };
+    //         if (!is_power_of_two(m_prefill_chunk_size)) {
+    //             OPENVINO_THROW("Configuration Error: chunk size (",
+    //                            m_prefill_chunk_size,
+    //                            ") is not power of 2. Please adjust NPUW_LLM_PREFILL_CHUNK_SIZE.");
+    //         }
+    //         max_prompt_len = align_to(max_prompt_len, static_cast<uint32_t>(m_prefill_chunk_size));
+    //     }
 
-        m_enable_prefix_caching = m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_PREFIX_CACHING>();
-        if (m_enable_prefix_caching) {
-            LOG_INFO("Prefix caching is enabled");
-            m_prefix_caching_block_size = m_cfg.get<::intel_npu::NPUW_LLM_PREFIX_CACHING_BLOCK_SIZE>();
-            if (!is_aligned_to(static_cast<uint32_t>(m_prefill_chunk_size),
-                               static_cast<uint32_t>(m_prefix_caching_block_size))) {
-                LOG_INFO("Prefix caching block size is adjusted to " << m_prefill_chunk_size);
-                m_prefix_caching_block_size = m_prefill_chunk_size;
-            }
-            m_prefix_caching_max_num_blocks = m_cfg.get<::intel_npu::NPUW_LLM_PREFIX_CACHING_MAX_NUM_BLOCKS>();
-            LOG_INFO("Prefix caching block size: " << m_prefix_caching_block_size);
-            LOG_INFO("Prefix caching maximum number of blocks: " << m_prefix_caching_max_num_blocks);
-        }
-    }
+    //     m_enable_prefix_caching = m_cfg.get<::intel_npu::NPUW_LLM_ENABLE_PREFIX_CACHING>();
+    //     if (m_enable_prefix_caching) {
+    //         LOG_INFO("Prefix caching is enabled");
+    //         m_prefix_caching_block_size = m_cfg.get<::intel_npu::NPUW_LLM_PREFIX_CACHING_BLOCK_SIZE>();
+    //         if (!is_aligned_to(static_cast<uint32_t>(m_prefill_chunk_size),
+    //                            static_cast<uint32_t>(m_prefix_caching_block_size))) {
+    //             LOG_INFO("Prefix caching block size is adjusted to " << m_prefill_chunk_size);
+    //             m_prefix_caching_block_size = m_prefill_chunk_size;
+    //         }
+    //         m_prefix_caching_max_num_blocks = m_cfg.get<::intel_npu::NPUW_LLM_PREFIX_CACHING_MAX_NUM_BLOCKS>();
+    //         LOG_INFO("Prefix caching block size: " << m_prefix_caching_block_size);
+    //         LOG_INFO("Prefix caching maximum number of blocks: " << m_prefix_caching_max_num_blocks);
+    //     }
+    // }
 
+    auto [max_prompt_len, min_response_len, max_generation_token_len] = get_context_limits(m_cfg);
+
+    m_prefill_chunk_size = get_prefill_chunk_size(m_cfg, max_prompt_len);
+    m_use_chunk_prefill = max_prompt_len > m_prefill_chunk_size;
+    max_prompt_len = align_to(max_prompt_len, static_cast<uint32_t>(m_prefill_chunk_size));
+
+    m_prefix_caching_max_num_blocks = get_prefix_caching_max_num_blocks(m_cfg, m_use_chunk_prefill, m_prefill_chunk_size);
+    m_enable_prefix_caching = m_prefix_caching_max_num_blocks > 0;
     LOG_VERB("Enabled prefill chunking: " << m_use_chunk_prefill);
     LOG_VERB("Prefill chunk size: " << m_prefill_chunk_size);
     LOG_VERB("Maximum prompt length: " << max_prompt_len);
@@ -1692,44 +2464,46 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     LOG_DEBUG("Creating kvcache model as clone of passed one.");
     auto kvcache_model = model->clone();
 
-    auto use_text_embed_key = pop_option(other_props, std::string("NPUW_TEXT_EMBED"));
-    m_is_embedding = use_text_embed_key.value_or(false).as<bool>() == true;
+    // auto use_text_embed_key = pop_option(other_props, std::string("NPUW_TEXT_EMBED"));
+    // m_is_embedding = use_text_embed_key.value_or(false).as<bool>() == true;
 
-    if (m_is_embedding) {
-        LOG_DEBUG("Text-embedding model rebuild");
-        ov::npuw::util::prepare_text_embedding_model(kvcache_model, seq_len_dim);
-    } else {
-        LOG_DEBUG("Transform kvcache model from stateful to stateless.");
-        ov::pass::StatefulToStateless().run_on_model(kvcache_model);
-    }
+    // if (m_is_embedding) {
+    //     LOG_DEBUG("Text-embedding model rebuild");
+    //     ov::npuw::util::prepare_text_embedding_model(kvcache_model, seq_len_dim);
+    // } else {
+    //     LOG_DEBUG("Transform kvcache model from stateful to stateless.");
+    //     ov::pass::StatefulToStateless().run_on_model(kvcache_model);
+    // }
 
-    convert_stateful_lora_to_stateless(kvcache_model);
+    // convert_stateful_lora_to_stateless(kvcache_model);
 
     LOG_DEBUG("   ...also convert BF16 to FP16");
     // Note: we need to identify original bf16 constants for potential weightless deserialization later
     // And only then do bf16 to f16 transformation
     m_bf16_consts = ov::npuw::s11n::get_bf16_consts(model);
-    ov::pass::ConvertPrecision(ov::element::bf16, ov::element::f16).run_on_model(kvcache_model);
+    // ov::pass::ConvertPrecision(ov::element::bf16, ov::element::f16).run_on_model(kvcache_model);
 
-    bool shared_head_enabled = m_cfg.get<::intel_npu::NPUW_LLM_SHARED_HEAD>();
-    std::shared_ptr<ov::Model> lm_head_model = nullptr;
-    if (shared_head_enabled) {
-        LOG_DEBUG("Trying to separate Vocabulary matrix multiplication op into additional model...");
-        lm_head_model = cut_lm_head(kvcache_model);
-        if (lm_head_model) {
-            LOG_INFO("Three-model pipeline will be created: LM head will be shared between prefill and generate.");
-        } else {
-            LOG_WARN("Three-model pipeline is requested, but LM head cutting is failed,"
-                     " two-model pipeline will be created!");
-        }
-    } else {
-        LOG_INFO("Two-model pipeline will be created.");
-    }
+    // bool shared_head_enabled = m_cfg.get<::intel_npu::NPUW_LLM_SHARED_HEAD>();
+    // std::shared_ptr<ov::Model> lm_head_model = nullptr;
+    // if (shared_head_enabled) {
+    //     LOG_DEBUG("Trying to separate Vocabulary matrix multiplication op into additional model...");
+    //     lm_head_model = cut_lm_head(kvcache_model);
+    //     if (lm_head_model) {
+    //         LOG_INFO("Three-model pipeline will be created: LM head will be shared between prefill and generate.");
+    //     } else {
+    //         LOG_WARN("Three-model pipeline is requested, but LM head cutting is failed,"
+    //                  " two-model pipeline will be created!");
+    //     }
+    // } else {
+    //     LOG_INFO("Two-model pipeline will be created.");
+    // }
 
-    if (!m_is_whisper) {
-        LOG_DEBUG("Try patch Phi-3 sliding window mask, if it exists.");
-        patch_phi3_sliding_mask(kvcache_model);
-    }
+    // if (!m_is_whisper) {
+    //     LOG_DEBUG("Try patch Phi-3 sliding window mask, if it exists.");
+    //     patch_phi3_sliding_mask(kvcache_model);
+    // }
+
+    auto lm_head_model = run_common_prolog_transformations(kvcache_model, m_cfg, m_is_embedding, m_is_whisper);
 
     LOG_DEBUG("Creating prefill model as clone of transformed kvcache one.");
     auto prefill_model = kvcache_model->clone();
@@ -1751,38 +2525,45 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         ov::npuw::util::prepare_whisper_kvcache_model(kvcache_model);         // Whisper decoder_with_past model
     }
 
+    // Run prefill section
+    prefill_model = run_prefill_transformations(prefill_model, max_prompt_len, min_response_len, max_generation_token_len,
+        kv_kache_storage_type, lm_head_model != nullptr, is_moe);
+
+    auto generate_model_variants = run_generate_transformations(kvcache_model, max_prompt_len, min_response_len, max_generation_token_len,
+        kv_kache_storage_type, is_moe);
+
     LOG_DEBUG("Make prefill model with static shapes");
     m_max_lora_rank = m_cfg.get<::intel_npu::NPUW_LLM_MAX_LORA_RANK>();
-    if (m_use_chunk_prefill) {
-        reshape_to_static(prefill_model,
-                          static_cast<uint32_t>(m_prefill_chunk_size),
-                          m_kvcache_desc.max_prompt_size,
-                          axes,
-                          m_max_lora_rank);
-    } else {
-        reshape_to_static(prefill_model,
-                          m_kvcache_desc.max_prompt_size,
-                          m_kvcache_desc.max_prompt_size,
-                          axes,
-                          m_max_lora_rank,
-                          whisper_lhs_seq_size);
-    }
+    // if (m_use_chunk_prefill) {
+    //     reshape_to_static(prefill_model,
+    //                       static_cast<uint32_t>(m_prefill_chunk_size),
+    //                       m_kvcache_desc.max_prompt_size,
+    //                       axes,
+    //                       m_max_lora_rank);
+    // } else {
+    //     reshape_to_static(prefill_model,
+    //                       m_kvcache_desc.max_prompt_size,
+    //                       m_kvcache_desc.max_prompt_size,
+    //                       axes,
+    //                       m_max_lora_rank,
+    //                       whisper_lhs_seq_size);
+    // }
     LOG_DEBUG("Make kvcache model with static shapes");
 
     // Create generate model variants with different sizes
-    auto generate_model_variants = create_generate_model_variants(kvcache_model, axes, whisper_lhs_seq_size);
+    // auto generate_model_variants = create_generate_model_variants(kvcache_model, axes, whisper_lhs_seq_size);
 
     if (lm_head_model) {
         LOG_DEBUG("Shared LM head: slice the prefill output");
         // KVCache model is already reshaped to [1, max_generation_token_len, embed size],
         // so only apply slice to the Prefill model:
-        slice_out_embeds(prefill_model, axes.batch, m_kvcache_desc.max_generation_token_len);
+        // slice_out_embeds(prefill_model, axes.batch, m_kvcache_desc.max_generation_token_len);
         LOG_DEBUG("Make LM head model with static shapes");
         reshape_sliced_head_to_static(lm_head_model, axes.batch, m_kvcache_desc.max_generation_token_len);
     }
 
     LOG_DEBUG("5.1, decompose GroupQueryAttention OP");
-    decompose_GQA(prefill_model, true);
+    // decompose_GQA(prefill_model, true);
     for (auto& model_variant : generate_model_variants) {
         decompose_GQA(model_variant, false);
     }
@@ -1829,10 +2610,10 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                                 " variants were optimized, which is not allowed.");
             }
         }
-        if (!prefill_attn_dyn && ov::npuw::util::optimize_value_tensors(prefill_model, true)) {
-            LOG_DEBUG("V-tensors tranposed in prefill model");
-            m_kvcache_desc.v_tensors_transposed_pre = true;
-        }
+        // if (!prefill_attn_dyn && ov::npuw::util::optimize_value_tensors(prefill_model, true)) {
+        //     LOG_DEBUG("V-tensors tranposed in prefill model");
+        //     m_kvcache_desc.v_tensors_transposed_pre = true;
+        // }
     } else {
         LOG_DEBUG("Check and apply opt layout --- SKIPPED");
     }
@@ -1840,11 +2621,11 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     if (!m_is_embedding) {
         if (!m_use_chunk_prefill) {
             // TODO: sometimes it is ok if we cannot find any empty inputs or not?
-            NPUW_ASSERT(remove_empty_kv_inputs(prefill_model));
+            // NPUW_ASSERT(remove_empty_kv_inputs(prefill_model));
         } else {
             LOG_DEBUG("Don't remove input key/values from prefill model.");
             LOG_DEBUG("Ask prefill model to output key/values for prefill chunk size tokens.");
-            prefill_model = redirect_new_kv_to_output(prefill_model);
+            // prefill_model = redirect_new_kv_to_output(prefill_model);
         }
 
         LOG_DEBUG("Optimize generate model to output key/values for new token.");
@@ -1858,7 +2639,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         generate_model_variants[i] = cvt_kvcache_to_low_precision(generate_model_variants[i], kv_kache_storage_type);
     }
     LOG_DEBUG("Converting KV-cache in prefill model to FP16.");
-    prefill_model = cvt_kvcache_to_low_precision(prefill_model, kv_kache_storage_type);
+    // prefill_model = cvt_kvcache_to_low_precision(prefill_model, kv_kache_storage_type);
 
     auto prefill_config =
         prefill_config_opt.value_or(get_default_prefill_config(prefill_model, npudesc)).as<ov::AnyMap>();
@@ -1953,7 +2734,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         if (!is_best || (max_prompt_len >= CACHE_ROPE_START)) {
             LOG_DEBUG("Enable RoPE Cache for prefill");
             ov::npuw::patterns::pre_compute::RopeCache rope_prefill_cacher(max_prompt_len);
-            rope_prefill_cacher.run_on_model(prefill_model);
+            // rope_prefill_cacher.run_on_model(prefill_model);
         }
 
         // Apply RoPE Cache to all generate variant models
@@ -1978,9 +2759,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
                 rewr.run_on_model(model_variant);
             }
         }
-        if (prefill_attn_dyn || prefill_attn_pyramid || prefill_attn_hfa) {
-            rewr.run_on_model(prefill_model);
-        }
+        // if (prefill_attn_dyn || prefill_attn_pyramid || prefill_attn_hfa) {
+        //     rewr.run_on_model(prefill_model);
+        // }
 
         // FIXME: generally all these patterns are supposed to improve the partitioning - thus
         // the performance. However, ShapeOfParameter seems to be working fine for all known case,
@@ -1990,7 +2771,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         for (auto& model_variant : generate_model_variants) {
             rewr2.run_on_model(model_variant);
         }
-        rewr2.run_on_model(prefill_model);
+        // rewr2.run_on_model(prefill_model);
     }
 
     // Compile multiple generate model variants with different sizes
@@ -2016,6 +2797,7 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
     implement_properties();
     LOG_DEBUG("Done");
 }
+*/
 
 ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& model,
                                              const std::shared_ptr<const ov::IPlugin>& plugin,
