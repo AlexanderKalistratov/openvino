@@ -4,11 +4,13 @@
 
 #include "attn_subgraph.hpp"
 
+#include <algorithm>
 #include <array>
 #include <limits>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include "../attention.hpp"
 #include "../compiled_model.hpp"
@@ -48,6 +50,9 @@ struct HFARequestSet {
 
     std::array<ov::SoPtr<ov::IAsyncInferRequest>, COUNT> infer_requests{};
     std::array<ov::SoPtr<ov::IAsyncInferRequest>, COUNT> pipeline_requests{};
+
+    // HFA pyramid: one request per larger regular-tile model, ascending by tile size
+    std::vector<ov::SoPtr<ov::IAsyncInferRequest>> pyramid_tile_requests;
 };
 
 struct RuntimeState {
@@ -354,6 +359,13 @@ void ensure_hfa_requests(ov::npuw::v1::subgraphs::InferContext& ctx, RuntimeStat
             auto pipeline_tensor = state.base_pipeline_request->get_tensor(final_tile_input);
             state.hfa_requests.pipeline_requests[HFARequestSet::REGULAR_TILE]->set_tensor(tile_input, pipeline_tensor);
         }
+    }
+
+    // Larger pyramid tiles keep their own K/V/mask buffers - their shapes differ from the
+    // base tile, so nothing can be shared with the final tile request here.
+    state.hfa_requests.pyramid_tile_requests.reserve(hfa->_compiled_pyramid_tile_models.size());
+    for (const auto& pyramid_tile_model : hfa->_compiled_pyramid_tile_models) {
+        state.hfa_requests.pyramid_tile_requests.push_back(pyramid_tile_model->create_infer_request());
     }
 
     if (!state.hfa_runtime_ctx.has_value()) {
@@ -949,6 +961,28 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         final_tile_request->set_tensor(hfa_desc->_compiled_final_tile_model->outputs()[0],
                                                        attention_output_tensor);
 
+                        // Pyramid tile requests share Q and the running (acc, max, d) state with the
+                        // base tile request. The state buffers may be swapped between calls, so this
+                        // has to be redone on every run - but only for the variants actually used.
+                        const auto& pyramid_tile_models = hfa_desc->_compiled_pyramid_tile_models;
+                        auto& pyramid_tile_requests = state.hfa_requests.pyramid_tile_requests;
+                        std::vector<char> pyramid_tile_state_bound(pyramid_tile_models.size(), 0);
+                        auto bind_pyramid_tile_state = [&](std::size_t variant) {
+                            if (pyramid_tile_state_bound[variant]) {
+                                return;
+                            }
+                            const auto& model = pyramid_tile_models[variant];
+                            auto& request = pyramid_tile_requests[variant];
+                            request->set_tensor(model->inputs()[tile_in.q], query_tensor);
+                            request->set_tensor(model->inputs()[tile_in.acc], state_acc);
+                            request->set_tensor(model->inputs()[tile_in.max], state_max);
+                            request->set_tensor(model->inputs()[tile_in.d], state_sum);
+                            request->set_tensor(model->outputs()[tile_out.acc], state_acc);
+                            request->set_tensor(model->outputs()[tile_out.max], state_max);
+                            request->set_tensor(model->outputs()[tile_out.d], state_sum);
+                            pyramid_tile_state_bound[variant] = 1;
+                        };
+
                         const uint32_t K_SEQ_DIM = static_cast<uint32_t>(sdpa_info._k_seq_dim);
                         const uint32_t V_SEQ_DIM = static_cast<uint32_t>(sdpa_info._v_seq_dim);
                         constexpr uint32_t MASK_KV_SEQ_DIM = 3;
@@ -962,7 +996,8 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                                 int64_t mask_offset,
                                                 int64_t tile_length,
                                                 bool async = false,
-                                                bool process_with_mask = true) {
+                                                bool process_with_mask = true,
+                                                bool use_mask_cache = true) {
                             auto k_tile_buffer = request->get_tensor(model->inputs()[tile_in.k]);
                             auto v_tile_buffer = request->get_tensor(model->inputs()[tile_in.v]);
                             ov::SoPtr<ov::ITensor> mask_tile_buffer;
@@ -1003,7 +1038,7 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                                                mask_offset,
                                                                tile_length)) {
                                     request->set_tensor(model->inputs()[tile_in.mask], attention_mask_tensor);
-                                } else if (state.hfa_runtime_ctx.has_value()) {
+                                } else if (use_mask_cache && state.hfa_runtime_ctx.has_value()) {
                                     auto cached_tile =
                                         state.hfa_runtime_ctx->find_cached_mask_tile(attention_mask_tensor,
                                                                                      mask_offset,
@@ -1054,6 +1089,11 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                         const bool uses_mask = hfa_desc->_compiled_tile_model->inputs().size() > tile_in.mask;
 
                         // Iterate through KV blocks; each block contributes block_size/tile_size tiles.
+                        // Within a block, cover the region largest-tile-first: a 5-chunk prompt runs
+                        // one 4x tile, a 4-chunk prompt a 2x tile plus a 1x tile, and so on. Without
+                        // the pyramid enabled there is only the base tile size and this degenerates
+                        // into the plain left-to-right walk.
+                        const auto& pyramid_tile_sizes = hfa_desc->_pyramid_tile_sizes;
                         for (size_t block_idx = 0; block_idx < past_key_blocks.size() && past_kv_tiles > 0;
                              ++block_idx) {
                             const auto& k_block = past_key_blocks[block_idx];
@@ -1063,18 +1103,34 @@ ov::npuw::v1::subgraphs::RuntimeBehaviorFactory make_runtime_factory() {
                                         "HFA block size must be a multiple of tile size");
                             const int64_t tiles_in_block = block_size / tile_size;
 
-                            for (int64_t t = 0; t < tiles_in_block && past_kv_tiles > 0; ++t) {
-                                process_tile(regular_tile_request,
-                                             hfa_desc->_compiled_tile_model,
+                            int64_t tiles_left = std::min(tiles_in_block, past_kv_tiles);
+                            int64_t kv_offset = 0;
+                            while (tiles_left > 0) {
+                                const int64_t length_left = tiles_left * tile_size;
+                                std::size_t variant = pyramid_tile_sizes.size();
+                                while (variant > 0 && pyramid_tile_sizes[variant - 1] > length_left) {
+                                    --variant;
+                                }
+                                const int64_t this_tile_size =
+                                    variant == 0 ? tile_size : pyramid_tile_sizes[variant - 1];
+                                if (variant > 0) {
+                                    bind_pyramid_tile_state(variant - 1);
+                                }
+                                process_tile(variant == 0 ? regular_tile_request : pyramid_tile_requests[variant - 1],
+                                             variant == 0 ? hfa_desc->_compiled_tile_model
+                                                          : pyramid_tile_models[variant - 1],
                                              k_block,
                                              v_block,
-                                             t * tile_size,
+                                             kv_offset,
                                              mask_tile_offset,
-                                             tile_size,
-                                             false,       // async
-                                             uses_mask);  // process_with_mask
-                                mask_tile_offset += tile_size;
-                                past_kv_tiles--;
+                                             this_tile_size,
+                                             false,          // async
+                                             uses_mask,      // process_with_mask
+                                             variant == 0);  // use_mask_cache
+                                kv_offset += this_tile_size;
+                                mask_tile_offset += this_tile_size;
+                                tiles_left -= this_tile_size / tile_size;
+                                past_kv_tiles -= this_tile_size / tile_size;
                             }
                         }
                         NPUW_ASSERT(past_kv_tiles == 0 &&
@@ -1254,6 +1310,27 @@ void serialize_compiled_state(v1::subgraphs::Context& context,
                                                                    submodel_ctx->import_config);
                 LOG_DEBUG("Imported compiled tile model for host flash attention");
             }
+        }
+        if (stream.output()) {
+            for (auto& pyramid_tile_model : mutable_hfa->_compiled_pyramid_tile_models) {
+                std::stringstream ss;
+                pyramid_tile_model->export_model(ss);
+                std::string model_str = ss.str();
+                stream & model_str;
+            }
+        } else if (!mutable_hfa->_pyramid_tile_sizes.empty()) {
+            NPUW_ASSERT(submodel_ctx != nullptr);
+            mutable_hfa->_compiled_pyramid_tile_models.resize(mutable_hfa->_pyramid_tile_sizes.size());
+            for (auto& pyramid_tile_model : mutable_hfa->_compiled_pyramid_tile_models) {
+                std::string model_str;
+                stream & model_str;
+                std::stringstream ss(model_str);
+                pyramid_tile_model = submodel_ctx->plugin->get_core()->import_model(ss,
+                                                                                    submodel_ctx->device,
+                                                                                    submodel_ctx->import_config);
+            }
+            LOG_DEBUG("Imported " << mutable_hfa->_compiled_pyramid_tile_models.size()
+                                  << " compiled pyramid tile model(s) for host flash attention");
         }
         if (stream.input()) {
             NPUW_ASSERT(submodel_ctx != nullptr);

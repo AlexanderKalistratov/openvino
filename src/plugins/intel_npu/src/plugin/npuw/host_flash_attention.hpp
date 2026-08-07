@@ -90,6 +90,11 @@ struct HostFlashAttention {
     // Final tiled model for flash attention execution (with division and transpose)
     std::shared_ptr<ov::Model> _final_tile_model;
 
+    // HFA pyramid: extra regular-tile models covering 2x, 4x, ... _tile_size, ascending.
+    // Empty unless NPUW_ATTN_HFA_PYRAMID is enabled.
+    std::vector<std::shared_ptr<ov::Model>> _pyramid_tile_models;
+    std::vector<int64_t> _pyramid_tile_sizes;
+
     // Tile configuration
     int64_t _tile_size = 0;  // K/V tile size for flash attention chunking
 
@@ -139,7 +144,8 @@ struct HostFlashAttention {
 
     // Factory method
     static std::optional<HostFlashAttention> from(const std::shared_ptr<ov::Model>& model,
-                                                  bool fused_flash_attention = true);
+                                                  bool fused_flash_attention = true,
+                                                  bool pyramid_tiles = false);
 };
 
 }  // namespace function
@@ -196,6 +202,7 @@ struct HostFlashAttention {
     // Models to compile (will be cleared after compilation)
     std::shared_ptr<ov::Model> _tile_model_to_compile;
     std::shared_ptr<ov::Model> _final_tile_model_to_compile;
+    std::vector<std::shared_ptr<ov::Model>> _pyramid_tile_models_to_compile;
 
     // Compiled tile model for NPU execution (regular tiles)
     ov::SoPtr<ov::ICompiledModel> _compiled_tile_model;
@@ -203,11 +210,17 @@ struct HostFlashAttention {
     // Compiled FINAL tile model for NPU execution (with division and transpose)
     ov::SoPtr<ov::ICompiledModel> _compiled_final_tile_model;
 
+    // HFA pyramid: compiled regular-tile models for 2x, 4x, ... _tile_size, ascending
+    std::vector<ov::SoPtr<ov::ICompiledModel>> _compiled_pyramid_tile_models;
+
     // Attention parameter info from original SDPA model (not from tile models)
     HostFlashAttentionInfo _sdpa_attention_info;
 
     // Tile configuration
     int64_t _tile_size = 0;
+
+    // Tile sizes matching _compiled_pyramid_tile_models, ascending
+    std::vector<int64_t> _pyramid_tile_sizes;
 
     /// Whether tensor views can be used for tile extraction (depends on compiler and driver support)
     bool _can_use_tensor_view = false;
@@ -227,6 +240,12 @@ struct HostFlashAttention {
     void set_compiled_final_tile_model(ov::SoPtr<ov::ICompiledModel> compiled_model) {
         _compiled_final_tile_model = std::move(compiled_model);
         _final_tile_model_to_compile.reset();  // Free memory after compilation
+    }
+
+    // Set the compiled pyramid tile models and clear the models to compile
+    void set_compiled_pyramid_tile_models(std::vector<ov::SoPtr<ov::ICompiledModel>> compiled_models) {
+        _compiled_pyramid_tile_models = std::move(compiled_models);
+        _pyramid_tile_models_to_compile.clear();  // Free memory after compilation
     }
 
     bool is_valid() const {

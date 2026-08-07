@@ -1883,6 +1883,25 @@ bool ov::npuw::CompiledModel::compile_for_success(std::size_t id, const std::vec
 
             hfa->set_compiled_tile_model(make_wrapped(hfa->_tile_model_to_compile, "/hfa_tile", devices));
             hfa->set_compiled_final_tile_model(desc.compiled_model);
+
+            const auto& pyramid_tile_models = hfa->_pyramid_tile_models_to_compile;
+            if (!pyramid_tile_models.empty()) {
+                std::vector<ov::SoPtr<ov::ICompiledModel>> compiled_pyramid_tiles(pyramid_tile_models.size());
+                auto compile_pyramid_tile = [&](size_t model_id) {
+                    compiled_pyramid_tiles[model_id] =
+                        make_wrapped(pyramid_tile_models[model_id],
+                                     "/hfa_tile_" + std::to_string(hfa->_pyramid_tile_sizes[model_id]),
+                                     devices);
+                };
+                if (m_cfg.get<::intel_npu::NPUW_PARALLEL_COMPILE>()) {
+                    ov::parallel_for(pyramid_tile_models.size(), compile_pyramid_tile);
+                } else {
+                    for (size_t model_id = 0; model_id < pyramid_tile_models.size(); ++model_id) {
+                        compile_pyramid_tile(model_id);
+                    }
+                }
+                hfa->set_compiled_pyramid_tile_models(std::move(compiled_pyramid_tiles));
+            }
             LOG_INFO("Host flash attention compilation complete for Subgraph[" << id << "]");
 
             if (supports_strides_for && !npu_device_str.empty()) {
@@ -2045,6 +2064,16 @@ void ov::npuw::CompiledModel::dump_subgraph_model(std::size_t id,
         std::string hfa_final_tile_model_dump_path =
             ov::util::path_join({dump_dir, hfa_final_tile_model_name}).string();
         ov::save_model(hfa_final_tile_model, hfa_final_tile_model_dump_path);
+
+        const auto& hfa_pyramid_tile_models = hfa->_pyramid_tile_models_to_compile;
+        for (std::size_t idx = 0; idx < hfa_pyramid_tile_models.size(); ++idx) {
+            std::string hfa_pyramid_tile_model_name = format_subgraph_name(id, funcall) + "_hfa_tile_" +
+                                                      std::to_string(hfa->_pyramid_tile_sizes[idx]) + ".xml";
+            std::string hfa_pyramid_tile_model_dump_path =
+                ov::util::path_join({dump_dir, hfa_pyramid_tile_model_name}).string();
+            ov::save_model(hfa_pyramid_tile_models[idx], hfa_pyramid_tile_model_dump_path);
+            LOG_INFO("Wrote " << hfa_pyramid_tile_model_dump_path);
+        }
     }
 }
 
@@ -2482,6 +2511,7 @@ void ov::npuw::CompiledModel::implement_properties() {
                           BIND(npuw::partitioning::dcoff_type, NPUW_DCOFF_TYPE),
                           BIND(npuw::partitioning::dcoff_with_scale, NPUW_DCOFF_SCALE),
                           BIND(npuw::partitioning::attn_hfa_fused, NPUW_ATTN_HFA_FUSED),
+                          BIND(npuw::partitioning::attn_hfa_pyramid, NPUW_ATTN_HFA_PYRAMID),
                           BIND(npuw::parallel_compilation, NPUW_PARALLEL_COMPILE),
                           BIND(npuw::ensure_compatibility, NPUW_ENSURE_COMPATIBILITY),
                           BIND(npuw::funcall_async, NPUW_FUNCALL_ASYNC),

@@ -121,6 +121,7 @@ std::vector<Case> make_cases() {
         bool_case<::intel_npu::NPUW_ATTN_DYN>("NPUW_ATTN_DYN", "NO", false),
         bool_case<::intel_npu::NPUW_ATTN_NO_COPY>("NPUW_ATTN_NO_COPY", "YES", true),
         bool_case<::intel_npu::NPUW_ATTN_HFA_FUSED>("NPUW_ATTN_HFA_FUSED", "YES", true),
+        bool_case<::intel_npu::NPUW_ATTN_HFA_PYRAMID>("NPUW_ATTN_HFA_PYRAMID", "YES", true),
         bool_case<::intel_npu::NPUW_PARALLEL_COMPILE>("NPUW_PARALLEL_COMPILE", "YES", true),
         bool_case<::intel_npu::NPUW_ENSURE_COMPATIBILITY>("NPUW_ENSURE_COMPATIBILITY", "YES", true),
         bool_case<::intel_npu::NPUW_FUNCALL_ASYNC>("NPUW_FUNCALL_ASYNC", "YES", true),

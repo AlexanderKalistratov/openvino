@@ -938,7 +938,8 @@ static std::optional<std::size_t> extract_sequence_dim_from_concat(const std::sh
 }
 
 std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr<ov::Model>& model,
-                                                           bool fused_flash_attention) {
+                                                           bool fused_flash_attention,
+                                                           bool pyramid_tiles) {
     LOG_INFO("Attempting to create HostFlashAttention"
              << (fused_flash_attention ? " with fused flash attention node" : ""));
     LOG_BLOCK();
@@ -1075,12 +1076,41 @@ std::optional<HostFlashAttention> HostFlashAttention::from(const std::shared_ptr
         return std::nullopt;
     }
 
+    // HFA pyramid: additionally build regular-tile models for 2x, 4x, ... the base tile size,
+    // as long as they still fit into the static context window. At run time the past KV is
+    // covered largest-tile-first, so a long history costs fewer inferences.
+    std::vector<std::shared_ptr<ov::Model>> pyramid_tile_models;
+    std::vector<int64_t> pyramid_tile_sizes;
+    if (pyramid_tiles) {
+        for (int64_t pyramid_tile_size = static_cast<int64_t>(query_size) * 2;
+             pyramid_tile_size < static_cast<int64_t>(context_size);
+             pyramid_tile_size *= 2) {
+            auto pyramid_tile_model = create_hfa_tile_model(q_shape_static,
+                                                            dtype,
+                                                            mask_dtype,
+                                                            pyramid_tile_size,
+                                                            kv_num_heads,
+                                                            false,
+                                                            fused_flash_attention,
+                                                            v_transposed);
+            if (!pyramid_tile_model) {
+                LOG_WARN("Failed to create HFA pyramid tile model of size " << pyramid_tile_size);
+                return std::nullopt;
+            }
+            pyramid_tile_models.push_back(pyramid_tile_model);
+            pyramid_tile_sizes.push_back(pyramid_tile_size);
+        }
+        LOG_INFO("Created " << pyramid_tile_models.size() << " HFA pyramid tile model(s)");
+    }
+
     // ========================================================================
     // Step 6: Create HostFlashAttention structure and set configuration
     // ========================================================================
     HostFlashAttention hfa;
     hfa._tile_model = tile_model;
     hfa._final_tile_model = final_tile_model;
+    hfa._pyramid_tile_models = std::move(pyramid_tile_models);
+    hfa._pyramid_tile_sizes = std::move(pyramid_tile_sizes);
     hfa._query_size = query_size;
     hfa._context_size = context_size;
     hfa._tile_size = query_size;
@@ -1125,6 +1155,8 @@ HostFlashAttention::HostFlashAttention(const function::HostFlashAttention& func_
     // Store the tile models for later compilation
     _tile_model_to_compile = func_hfa._tile_model;
     _final_tile_model_to_compile = func_hfa._final_tile_model;
+    _pyramid_tile_models_to_compile = func_hfa._pyramid_tile_models;
+    _pyramid_tile_sizes = func_hfa._pyramid_tile_sizes;
 
     // Copy query size, context size, and K/V sequence dimensions from function HFA
     _sdpa_attention_info._query_size = func_hfa._query_size;
