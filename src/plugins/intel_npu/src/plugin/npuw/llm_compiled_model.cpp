@@ -28,6 +28,7 @@
 #include "npuw_transformations/right_align_mask_slice_for_conv.hpp"
 #include "npuw_transformations/slice_out_embeds.hpp"
 #include "npuw_transformations/split_kvcache_into_blocks.hpp"
+#include "openvino/core/parallel.hpp"
 #include "openvino/op/convert.hpp"
 #include "openvino/op/greater.hpp"
 #include "openvino/op/ops.hpp"
@@ -105,6 +106,43 @@ public:
                 auto matched_qweight_const = std::static_pointer_cast<ov::op::v0::Constant>(matched_qweight);
                 auto matched_qzerop_const = std::static_pointer_cast<ov::op::v0::Constant>(matched_qzerop);
 
+                const auto& qweight_shape = matched_qweight_const->get_shape();
+                const auto& qzerop_shape = matched_qzerop_const->get_shape();
+                // The shift below is per vocab entry, so the zero point must be per vocab entry too
+                if (matched_qzerop_const->get_element_type() != ov::element::u8 || qzerop_shape.size() != 2 ||
+                    qzerop_shape[0] != qweight_shape[0] || qzerop_shape[1] != 1) {
+                    return false;
+                }
+
+                // Per vocab entry shift c[v], applied to both the vocab row and its zero point.
+                // Any c cancels out - (w - c) - (z - c) == w - z - so this stays bit-exact; a
+                // per-entry c centres the row around zero instead of merely mapping it into the
+                // i8 range, which is what keeps the MatMul-first form (see MatMulFirstAsymVocab)
+                // from having to cancel two large terms against each other.
+                //
+                // c[v] = (min + max + 1) / 2 taken over the row's weights AND its zero point.
+                // With every input in [0, 255] the row span d = max - min is at most 255, and
+                // rounding the midpoint UP gives max - c <= 127 and min - c >= -128 for every d,
+                // so neither the shifted weights nor the shifted zero point can overflow i8.
+                // (Rounding down instead - (min + max) / 2 - would yield max - c == 128 at d = 255.)
+                const auto vocab_size = qweight_shape[0];
+                const auto row_size = qweight_shape[1];
+                const auto* qweight_data = static_cast<const uint8_t*>(matched_qweight_const->get_data_ptr());
+                const auto* qzerop_data = static_cast<const uint8_t*>(matched_qzerop_const->get_data_ptr());
+
+                ov::Tensor shift(ov::element::i32, ov::Shape{vocab_size});
+                auto* shift_data = shift.data<int32_t>();
+                ov::parallel_for(vocab_size, [&](std::size_t v) {
+                    const auto* row = qweight_data + v * row_size;
+                    uint8_t lo = qzerop_data[v];
+                    uint8_t hi = qzerop_data[v];
+                    for (std::size_t i = 0; i < row_size; ++i) {
+                        lo = std::min(lo, row[i]);
+                        hi = std::max(hi, row[i]);
+                    }
+                    shift_data[v] = (static_cast<int32_t>(lo) + static_cast<int32_t>(hi) + 1) / 2;
+                });
+
                 auto reinterpret_u8_as_i8 = [](const std::shared_ptr<ov::op::v0::Constant>& src) {
                     OPENVINO_ASSERT(src->get_element_type() == ov::element::u8);
                     auto dst = std::make_shared<ov::op::v0::Constant>(
@@ -120,15 +158,17 @@ public:
                     return dst;
                 };
 
-                // To not mmap and allocate vocab memory here, its shifting will be deferred to the LazyTensor unpacking
-                // stage.
+                // To not allocate a shifted copy of the vocab here, the shifting itself is deferred
+                // to the LazyTensor unpacking stage (only the min/max scan above reads the weight).
                 auto i8_qweight_constant = reinterpret_u8_as_i8(matched_qweight_const);
-                // Inform partitioning, that this Const is special and needs to be unpacked with -128 shift applied.
-                i8_qweight_constant->get_rt_info()[ov::npuw::weights::op::Sub128::rt_key] = true;
+                // Inform partitioning, that this Const is special and needs to be unpacked with
+                // the per vocab entry shift applied.
+                i8_qweight_constant->get_rt_info()[ov::npuw::weights::op::SubRows::rt_key] = shift;
                 ov::replace_node(matched_qweight_const, i8_qweight_constant);
                 auto i8_qzerop_constant = reinterpret_u8_as_i8(matched_qzerop_const);
-                // Inform partitioning, that this Const is special and needs to be unpacked with -128 shift applied.
-                i8_qzerop_constant->get_rt_info()[ov::npuw::weights::op::Sub128::rt_key] = true;
+                // The zero point is shifted by the very same per-entry value, so that
+                // (w - c) - (z - c) reproduces the original w - z exactly.
+                i8_qzerop_constant->get_rt_info()[ov::npuw::weights::op::SubRows::rt_key] = shift;
                 ov::replace_node(matched_qzerop_const, i8_qzerop_constant);
                 return true;
             }
@@ -139,8 +179,14 @@ public:
 };
 
 // Rewrites the LM head DQ chain so the heavy MatMul consumes raw u8/i8 weight and the
-// per-row (weight - zerop) * scale dequant is applied after it:
-//   logits = (x @ W^T) * s - sum(x, axis=-1) * (z * s)
+// per-row (weight - zerop) * scale dequant is applied after it. The activation is
+// mean-centred first, so that sum(x - mu) == 0 makes both the per-row weight shift and
+// the per-row zero point drop out of the MatMul:
+//   logits = ((x - mu) @ W^T + mu * rowsum) * s,  rowsum[v] = sum_k w[v,k] - K * z[v]
+// The accumulator then carries logits/s and nothing else. The plainer
+// (x @ W^T) * s - sum(x) * (z * s) form is algebraically the same but has its
+// accumulator inflated by the zero-point term - measured up to 5x on phi-4-mini -
+// only for that term to be cancelled again afterwards, which costs f16 precision.
 class MatMulFirstAsymVocab : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::MatMulFirstAsymVocab");
@@ -180,35 +226,64 @@ public:
                 return false;
             }
 
-            auto hidden = node_to_output.at(qmmi);
-            const auto vocab_size = static_cast<int64_t>(matched_qweight->get_shape()[0]);
+            const auto& qweight_shape = matched_qweight->get_shape();
+            const auto& qzerop_shape = matched_qzerop->get_shape();
+            if (matched_qzerop->get_element_type() != matched_qweight->get_element_type() || qzerop_shape.size() != 2 ||
+                qzerop_shape[0] != qweight_shape[0] || qzerop_shape[1] != 1) {
+                return false;
+            }
 
-            // // (x @ W^T) with raw u8 weight cast to f32; compiler may fuse the Convert into MatMul.
+            const auto vocab_size = static_cast<int64_t>(qweight_shape[0]);
+            const auto row_size = qweight_shape[1];
+
+            // rowsum[v] = sum_k w[v,k] - K * z[v]. Both constants carry the same per-row
+            // shift (if any) and the expression is invariant to it, so raw values will do -
+            // but a SubRows-marked Constant still holds unshifted u8 codes behind an i8 type.
+            const bool as_u8 = matched_qweight->get_element_type() == ov::element::u8 ||
+                               matched_qweight->get_rt_info().count(ov::npuw::weights::op::SubRows::rt_key) > 0;
+            const auto* qweight_data = static_cast<const uint8_t*>(
+                std::static_pointer_cast<ov::op::v0::Constant>(matched_qweight)->get_data_ptr());
+            const auto* qzerop_data = static_cast<const uint8_t*>(
+                std::static_pointer_cast<ov::op::v0::Constant>(matched_qzerop)->get_data_ptr());
+
+            // |rowsum| <= 2 * K * 255, well inside f32's exactly-representable integer range
+            std::vector<float> rowsum(vocab_size);
+            ov::parallel_for(vocab_size, [&](int64_t v) {
+                const auto* row = qweight_data + v * row_size;
+                int64_t sum = 0;
+                for (std::size_t i = 0; i < row_size; ++i) {
+                    sum += as_u8 ? int64_t{row[i]} : int64_t{static_cast<int8_t>(row[i])};
+                }
+                const int64_t zerop = as_u8 ? int64_t{qzerop_data[v]} : int64_t{static_cast<int8_t>(qzerop_data[v])};
+                rowsum[v] = static_cast<float>(sum - static_cast<int64_t>(row_size) * zerop);
+            });
+
+            auto hidden = node_to_output.at(qmmi);
+            auto reduce_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
+            auto mean_h = std::make_shared<ov::op::v1::ReduceMean>(hidden, reduce_axis, true);
+            mean_h->set_friendly_name("reduce_mean_h");
+            auto centred = std::make_shared<ov::op::v1::Subtract>(hidden, mean_h);
+            centred->set_friendly_name("centred_h");
+
+            // The Convert must stay foldable into the MatMul so the vocab reaches the device as
+            // i8 - materializing an f16 copy of it is exactly what this pass exists to avoid.
             auto w_f32 = std::make_shared<ov::op::v0::Convert>(matched_qweight, ov::element::f32);
-            auto new_matmul = std::make_shared<ov::op::v0::MatMul>(hidden, w_f32, false, true);
+            auto new_matmul = std::make_shared<ov::op::v0::MatMul>(centred, w_f32, false, true);
+
+            auto rowsum_const = ov::op::v0::Constant::create(ov::element::f32,
+                                                             ov::Shape{1, 1, static_cast<std::size_t>(vocab_size)},
+                                                             rowsum);
+            auto dc = std::make_shared<ov::op::v1::Multiply>(mean_h, rowsum_const);
+            dc->set_friendly_name("mean_times_rowsum");
+            auto restored = std::make_shared<ov::op::v1::Add>(new_matmul, dc);
+            restored->set_friendly_name("add_after_matmul");
 
             auto s_f32 = std::make_shared<ov::op::v0::Convert>(matched_qcoeff, ov::element::f32);
             auto s_reshape =
                 ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, std::vector<int64_t>{1, 1, vocab_size});
             auto scale_reshaped = std::make_shared<ov::op::v1::Reshape>(s_f32, s_reshape, false);
-            auto scaled = std::make_shared<ov::op::v1::Multiply>(new_matmul, scale_reshaped);
-            scaled->set_friendly_name("scale_after_matmul");
-
-            auto z_f32 = std::make_shared<ov::op::v0::Convert>(matched_qzerop, ov::element::f32);
-            auto zp_scale = std::make_shared<ov::op::v1::Multiply>(z_f32, s_f32);
-            zp_scale->set_friendly_name("zero_point_scale");
-            auto zp_reshape =
-                ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, std::vector<int64_t>{1, 1, vocab_size});
-            auto zp_reshaped = std::make_shared<ov::op::v1::Reshape>(zp_scale, zp_reshape, false);
-
-            auto reduce_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
-            auto sum_h = std::make_shared<ov::op::v1::ReduceSum>(hidden, reduce_axis, true);
-            sum_h->set_friendly_name("reduce_sum_h");
-            auto zp_correction = std::make_shared<ov::op::v1::Multiply>(sum_h, zp_reshaped);
-            zp_correction->set_friendly_name("zp_scale_after_matmul");
-
-            auto logits = std::make_shared<ov::op::v1::Subtract>(scaled, zp_correction);
-            logits->set_friendly_name("subtract_after_matmul");
+            auto logits = std::make_shared<ov::op::v1::Multiply>(restored, scale_reshaped);
+            logits->set_friendly_name("scale_after_matmul");
             // Preserve tensor names (e.g. "logits") from the old MatMul output so consumers keep working.
             logits->output(0).set_names(matched_matmul->output(0).get_names());
 

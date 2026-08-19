@@ -27,7 +27,7 @@ class Unpack;
 class Permute;
 class Convert;
 class Gather;
-class Sub128;
+class SubRows;
 }  // namespace op
 
 class LazyTensor {
@@ -43,7 +43,7 @@ public:
                                    ov::npuw::weights::op::Permute,
                                    ov::npuw::weights::op::Convert,
                                    ov::npuw::weights::op::Gather,
-                                   ov::npuw::weights::op::Sub128>;
+                                   ov::npuw::weights::op::SubRows>;
 
     LazyTensor() = default;
     LazyTensor(const std::shared_ptr<ov::op::v0::Constant>& const_ptr);
@@ -60,7 +60,8 @@ public:
 
     LazyTensor permute(const std::vector<std::size_t>& axes);
     LazyTensor convert(const ov::element::Type& type);
-    LazyTensor sub128();  // byte-wise -128 zero-point shift (u8/i8 -> symmetric i8)
+    // byte-wise per-row zero-point shift (u8/i8 -> centred i8), shift is i32 [rows]
+    LazyTensor sub_rows(const ov::Tensor& shift);
 
     bool operator==(const LazyTensor& other) const;
     bool operator!=(const LazyTensor& other) const;
@@ -245,21 +246,22 @@ private:
     ov::Shape dst_shape;
 };
 
-class Sub128 {
+class SubRows {
     friend struct ov::npuw::weights::LazyTensorImpl;
 
 public:
     static constexpr std::uint16_t kVersion = 0u;
 
-    // rt_info marker: a graph-level pass puts this key on a Constant to request
-    // the -128 shift to be applied when the weight is lifted into a closure
-    static constexpr const char* rt_key = "npuw::sub128";
+    // rt_info marker: a graph-level pass puts this key on a Constant, with the
+    // per-row shift vector (i32 [rows]) as its value, to request the shift to be
+    // applied when the weight is lifted into a closure
+    static constexpr const char* rt_key = "npuw::sub_rows";
 
-    Sub128() = default;
-    explicit Sub128(const LazyTensor& _tensor) : tensor(_tensor) {}
+    SubRows() = default;
+    SubRows(const LazyTensor& _tensor, const ov::Tensor& _shift) : tensor(_tensor), shift(_shift) {}
 
     std::size_t hash() const;
-    bool operator==(const Sub128& other) const;
+    bool operator==(const SubRows& other) const;
     ov::Tensor eval() const;
     LazyTensor::Meta eval_meta() const;
     void read_weight(const ov::npuw::s11n::WeightsContext& ctx);
@@ -268,6 +270,7 @@ public:
 
 private:
     LazyTensor tensor;
+    ov::Tensor shift;
 };
 }  // namespace op
 
