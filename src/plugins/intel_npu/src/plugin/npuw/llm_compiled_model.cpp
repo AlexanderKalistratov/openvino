@@ -180,13 +180,14 @@ public:
 
 // Rewrites the LM head DQ chain so the heavy MatMul consumes raw u8/i8 weight and the
 // per-row (weight - zerop) * scale dequant is applied after it. The activation is
-// mean-centred first, so that sum(x - mu) == 0 makes both the per-row weight shift and
-// the per-row zero point drop out of the MatMul:
-//   logits = ((x - mu) @ W^T + mu * rowsum) * s,  rowsum[v] = sum_k w[v,k] - K * z[v]
-// The accumulator then carries logits/s and nothing else. The plainer
-// (x @ W^T) * s - sum(x) * (z * s) form is algebraically the same but has its
-// accumulator inflated by the zero-point term - measured up to 5x on phi-4-mini -
-// only for that term to be cancelled again afterwards, which costs f16 precision.
+// mean-centred and L2-normalized first, so that sum(x - mu) == 0 makes both the per-row
+// weight shift and the per-row zero point drop out of the MatMul:
+//   q = (x - mu) / n,  n = ||x - mu||
+//   logits = (q @ W^T + (mu / n) * rowsum) * s * n,  rowsum[v] = sum_k w[v,k] - K * z[v]
+// The accumulator then carries logits/(s*n) and nothing else, bounded by ||W_row|| for
+// any input. The plainer (x @ W^T) * s - sum(x) * (z * s) form is algebraically the same
+// but has its accumulator inflated by the zero-point term - measured up to 5x on
+// phi-4-mini - only for that term to be cancelled again, which costs f16 precision.
 class MatMulFirstAsymVocab : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::MatMulFirstAsymVocab");
@@ -265,15 +266,42 @@ public:
             auto centred = std::make_shared<ov::op::v1::Subtract>(hidden, mean_h);
             centred->set_friendly_name("centred_h");
 
+            // L2-normalize the activation, which bounds the MatMul accumulator by
+            // ||W_row||_2 = 128 * sqrt(K) for ANY input - 7095 for K=3072, far inside f16 range.
+            // Same op sequence as the model's own RMSNorm (Power/ReduceMean/Add/Sqrt/Divide) so
+            // the NPU's compute-layers-with-higher-precision list covers it and the square cannot
+            // overflow. The norm cancels exactly, so any positive value works and eps is free.
+            const auto f32_scalar = ov::Shape{1, 1, 1};
+            auto squared = std::make_shared<ov::op::v1::Power>(
+                centred,
+                ov::op::v0::Constant::create(ov::element::f32, f32_scalar, std::vector<float>{2.0f}));
+            auto mean_squared = std::make_shared<ov::op::v1::ReduceMean>(squared, reduce_axis, true);
+            auto biased = std::make_shared<ov::op::v1::Add>(
+                mean_squared,
+                ov::op::v0::Constant::create(ov::element::f32, f32_scalar, std::vector<float>{1e-6f}));
+            auto rms = std::make_shared<ov::op::v0::Sqrt>(biased);
+            const auto sqrt_k = std::sqrt(static_cast<float>(row_size));
+            auto inv_norm = std::make_shared<ov::op::v1::Divide>(
+                ov::op::v0::Constant::create(ov::element::f32, f32_scalar, std::vector<float>{1.0f / sqrt_k}),
+                rms);
+            inv_norm->set_friendly_name("inv_norm_h");
+            auto norm = std::make_shared<ov::op::v1::Multiply>(
+                rms,
+                ov::op::v0::Constant::create(ov::element::f32, f32_scalar, std::vector<float>{sqrt_k}));
+            norm->set_friendly_name("norm_h");
+            auto normed = std::make_shared<ov::op::v1::Multiply>(centred, inv_norm);
+            normed->set_friendly_name("normed_h");
+
             // The Convert must stay foldable into the MatMul so the vocab reaches the device as
             // i8 - materializing an f16 copy of it is exactly what this pass exists to avoid.
             auto w_f32 = std::make_shared<ov::op::v0::Convert>(matched_qweight, ov::element::f32);
-            auto new_matmul = std::make_shared<ov::op::v0::MatMul>(centred, w_f32, false, true);
+            auto new_matmul = std::make_shared<ov::op::v0::MatMul>(normed, w_f32, false, true);
 
             auto rowsum_const = ov::op::v0::Constant::create(ov::element::f32,
                                                              ov::Shape{1, 1, static_cast<std::size_t>(vocab_size)},
                                                              rowsum);
-            auto dc = std::make_shared<ov::op::v1::Multiply>(mean_h, rowsum_const);
+            auto mean_over_norm = std::make_shared<ov::op::v1::Multiply>(mean_h, inv_norm);
+            auto dc = std::make_shared<ov::op::v1::Multiply>(mean_over_norm, rowsum_const);
             dc->set_friendly_name("mean_times_rowsum");
             auto restored = std::make_shared<ov::op::v1::Add>(new_matmul, dc);
             restored->set_friendly_name("add_after_matmul");
@@ -282,8 +310,12 @@ public:
             auto s_reshape =
                 ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, std::vector<int64_t>{1, 1, vocab_size});
             auto scale_reshaped = std::make_shared<ov::op::v1::Reshape>(s_f32, s_reshape, false);
-            auto logits = std::make_shared<ov::op::v1::Multiply>(restored, scale_reshaped);
-            logits->set_friendly_name("scale_after_matmul");
+            auto scaled = std::make_shared<ov::op::v1::Multiply>(restored, scale_reshaped);
+            scaled->set_friendly_name("scale_after_matmul");
+            // Undo the normalization only after the per-row scale: the other order rebuilds
+            // logits/s, which for a small-scale row can be far outside f16 range.
+            auto logits = std::make_shared<ov::op::v1::Multiply>(scaled, norm);
+            logits->set_friendly_name("denorm_after_matmul");
             // Preserve tensor names (e.g. "logits") from the old MatMul output so consumers keep working.
             logits->output(0).set_names(matched_matmul->output(0).get_names());
 
