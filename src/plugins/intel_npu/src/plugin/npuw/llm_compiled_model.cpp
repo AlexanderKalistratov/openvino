@@ -67,23 +67,44 @@ bool is_aligned_to(T value, T alignment) {
     return value % alignment == 0;
 }
 
+// Asymmetrically quantized vocab (LM head) dequantization chain:
+//   Constant(w) -> Convert -.
+//                            Subtract -> Multiply(scale) -> Convert -> MatMul -> Result
+//   Constant(z) -> Convert -'
+struct AsymVocabPattern {
+    std::shared_ptr<ov::Node> qweight;
+    std::shared_ptr<ov::Node> qcoeff;
+    std::shared_ptr<ov::Node> qzerop;
+    std::shared_ptr<ov::Node> qmmi;
+    std::shared_ptr<ov::Node> qmm;
+    std::shared_ptr<ov::Node> qres;
+
+    AsymVocabPattern() {
+        qweight = opp::wrap_type<ov::op::v0::Constant>();
+        qcoeff = opp::wrap_type<ov::op::v0::Constant>();
+        qzerop = opp::wrap_type<ov::op::v0::Constant>();
+        auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
+        auto qcvtz = opp::wrap_type<ov::op::v0::Convert>({qzerop});
+        auto qsub = opp::wrap_type<ov::op::v1::Subtract>({qcvtw, qcvtz});
+        auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qsub, qcoeff});
+        auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
+        qmmi = opp::any_input();
+        qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qcvtm});
+        qres = opp::wrap_type<ov::op::v0::Result>({qmm});
+    }
+};
+
 }  // namespace
 
 class ConvertVocabAsymU8ToI8 : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::ConvertVocabU8ToI8");
     explicit ConvertVocabAsymU8ToI8() {
-        auto qweight = opp::wrap_type<ov::op::v0::Constant>();
-        auto qcoeff = opp::wrap_type<ov::op::v0::Constant>();
-        auto qzerop = opp::wrap_type<ov::op::v0::Constant>();
-        auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
-        auto qcvtz = opp::wrap_type<ov::op::v0::Convert>({qzerop});
-        auto qsub = opp::wrap_type<ov::op::v1::Subtract>({qcvtw, qcvtz});
-        auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qsub, qcoeff});
-        auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
-        auto qmmi = opp::any_input();
-        auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qcvtm});
-        auto qres = opp::wrap_type<ov::op::v0::Result>({qmm});
+        AsymVocabPattern p;
+        const auto& qweight = p.qweight;
+        const auto& qcoeff = p.qcoeff;
+        const auto& qzerop = p.qzerop;
+        const auto& qmm = p.qmm;
 
         auto callback = [=](opp::Matcher& m) {
             auto& node_to_output = m.get_pattern_value_map();
@@ -145,10 +166,15 @@ public:
 
                 auto reinterpret_u8_as_i8 = [](const std::shared_ptr<ov::op::v0::Constant>& src) {
                     OPENVINO_ASSERT(src->get_element_type() == ov::element::u8);
+                    const void* src_data = src->get_data_ptr();
+                    OPENVINO_ASSERT(src_data != nullptr,
+                                    "Constant ",
+                                    src->get_friendly_name(),
+                                    " has no data to reinterpret as i8");
                     auto dst = std::make_shared<ov::op::v0::Constant>(
                         ov::element::i8,
                         src->get_shape(),
-                        src->get_data_ptr(),
+                        src_data,
                         src);  // <-- 'so': source node kept alive => no dangling, no copy
                     dst->set_friendly_name(src->get_friendly_name());
                     // FIXME: This copies weightless attribute to not preserve a constant as a new for weightless
@@ -174,38 +200,37 @@ public:
             }
             return false;
         };
-        register_matcher(std::make_shared<opp::Matcher>(qres, "ConvertVocabAsymU8ToI8"), std::move(callback));
+        register_matcher(std::make_shared<opp::Matcher>(p.qres, "ConvertVocabAsymU8ToI8"), std::move(callback));
     }
 };
 
-// Rewrites the LM head DQ chain so the heavy MatMul consumes raw u8/i8 weight and the
-// per-row (weight - zerop) * scale dequant is applied after it. The activation is
-// mean-centred and L2-normalized first, so that sum(x - mu) == 0 makes both the per-row
-// weight shift and the per-row zero point drop out of the MatMul:
+// Rewrites the LM head DQ chain so the heavy MatMul consumes the raw u8/i8 weight with only
+// the per-row scale folded onto it - the form the compiler turns into a native mixed-precision
+// (i4/i8 weight x f16 activation) MatMul - and the zero point is corrected away from the graph
+// entirely. The activation is mean-centred and L2-normalized first, so that sum(x - mu) == 0
+// makes both the per-row weight shift and the per-row zero point drop out of the MatMul:
 //   q = (x - mu) / n,  n = ||x - mu||
-//   logits = (q @ W^T + (mu / n) * rowsum) * s * n,  rowsum[v] = sum_k w[v,k] - K * z[v]
-// The accumulator then carries logits/(s*n) and nothing else, bounded by ||W_row|| for
-// any input. The plainer (x @ W^T) * s - sum(x) * (z * s) form is algebraically the same
-// but has its accumulator inflated by the zero-point term - measured up to 5x on
-// phi-4-mini - only for that term to be cancelled again, which costs f16 precision.
+//   logits = (q @ (W * s)^T) * n + mu * (rowsum * s),  rowsum[v] = sum_k w[v,k] - K * z[v]
+// so there are two scales: one before the MatMul, on the weight, and one folded at compile
+// time into the correction constant. The accumulator then carries q @ W^T and nothing else,
+// bounded by ||W_row|| for any input. The plainer x @ (W * s)^T - sum(x) * (z * s) form is
+// algebraically the same but has its accumulator inflated by the zero-point term - measured
+// up to 5x on phi-4-mini - only for that term to be cancelled again, which costs f16 precision.
 class MatMulFirstAsymVocab : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::MatMulFirstAsymVocab");
     explicit MatMulFirstAsymVocab() {
-        auto qweight = opp::wrap_type<ov::op::v0::Constant>();
-        auto qcoeff = opp::wrap_type<ov::op::v0::Constant>();
-        auto qzerop = opp::wrap_type<ov::op::v0::Constant>();
-        auto qcvtw = opp::wrap_type<ov::op::v0::Convert>({qweight});
-        auto qcvtz = opp::wrap_type<ov::op::v0::Convert>({qzerop});
-        auto qsub = opp::wrap_type<ov::op::v1::Subtract>({qcvtw, qcvtz});
-        auto qmuls = opp::wrap_type<ov::op::v1::Multiply>({qsub, qcoeff});
-        auto qcvtm = opp::wrap_type<ov::op::v0::Convert>({qmuls});
-        auto qmmi = opp::any_input();
-        auto qmm = opp::wrap_type<ov::op::v0::MatMul>({qmmi, qcvtm});
-        auto qres = opp::wrap_type<ov::op::v0::Result>({qmm});
+        AsymVocabPattern p;
+        const auto& qweight = p.qweight;
+        const auto& qcoeff = p.qcoeff;
+        const auto& qzerop = p.qzerop;
+        const auto& qmmi = p.qmmi;
+        const auto& qmm = p.qmm;
+        const auto& qres = p.qres;
 
         auto callback = [=](opp::Matcher& m) {
             auto& node_to_output = m.get_pattern_value_map();
+
             auto matched_qweight = node_to_output.at(qweight).get_node_shared_ptr();
             if (matched_qweight->get_element_type() != ov::element::u8 &&
                 matched_qweight->get_element_type() != ov::element::i8) {
@@ -214,9 +239,10 @@ public:
             if (matched_qweight->get_shape().size() != 2) {
                 return false;
             }
+
             auto matched_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
-            auto matched_qzerop = node_to_output.at(qzerop).get_node_shared_ptr();
             auto qcoeff_shape = matched_qcoeff->get_shape();
+            auto matched_qzerop = node_to_output.at(qzerop).get_node_shared_ptr();
             auto matched_matmul =
                 std::static_pointer_cast<ov::op::v0::MatMul>(node_to_output.at(qmm).get_node_shared_ptr());
             auto matched_result =
@@ -234,21 +260,31 @@ public:
                 return false;
             }
 
+            auto hidden = node_to_output.at(qmmi);
+            const auto hidden_rank = hidden.get_partial_shape().rank();
+            if (hidden_rank.is_dynamic()) {
+                return false;
+            }
+            const auto compute_type = hidden.get_element_type();
             const auto vocab_size = static_cast<int64_t>(qweight_shape[0]);
             const auto row_size = qweight_shape[1];
 
-            // rowsum[v] = sum_k w[v,k] - K * z[v]. Both constants carry the same per-row
-            // shift (if any) and the expression is invariant to it, so raw values will do -
-            // but a SubRows-marked Constant still holds unshifted u8 codes behind an i8 type.
+            // rowsum[v] = sum_k w[v,k] - K * z[v], premultiplied by the row's own scale - this is
+            // the "scale after the MatMul" of the pair, folded into a constant at compile time so
+            // that the scale Constant keeps a single consumer (the DQ Multiply on the weight) and
+            // the raw rowsum, which can reach 2 * K * 255, never has to survive in f16.
+            // Both quantized constants carry the same per-row shift (if any) and the expression is
+            // invariant to it, so raw values will do - but a SubRows-marked Constant still holds
+            // unshifted u8 codes behind an i8 type.
             const bool as_u8 = matched_qweight->get_element_type() == ov::element::u8 ||
                                matched_qweight->get_rt_info().count(ov::npuw::weights::op::SubRows::rt_key) > 0;
             const auto* qweight_data = static_cast<const uint8_t*>(
                 std::static_pointer_cast<ov::op::v0::Constant>(matched_qweight)->get_data_ptr());
             const auto* qzerop_data = static_cast<const uint8_t*>(
                 std::static_pointer_cast<ov::op::v0::Constant>(matched_qzerop)->get_data_ptr());
+            const auto scales = std::static_pointer_cast<ov::op::v0::Constant>(matched_qcoeff)->cast_vector<float>();
 
-            // |rowsum| <= 2 * K * 255, well inside f32's exactly-representable integer range
-            std::vector<float> rowsum(vocab_size);
+            std::vector<float> rowsum_scaled(vocab_size);
             ov::parallel_for(vocab_size, [&](int64_t v) {
                 const auto* row = qweight_data + v * row_size;
                 int64_t sum = 0;
@@ -256,10 +292,10 @@ public:
                     sum += as_u8 ? int64_t{row[i]} : int64_t{static_cast<int8_t>(row[i])};
                 }
                 const int64_t zerop = as_u8 ? int64_t{qzerop_data[v]} : int64_t{static_cast<int8_t>(qzerop_data[v])};
-                rowsum[v] = static_cast<float>(sum - static_cast<int64_t>(row_size) * zerop);
+                // |rowsum| <= 2 * K * 255, well inside f32's exactly-representable integer range
+                rowsum_scaled[v] = static_cast<float>(sum - static_cast<int64_t>(row_size) * zerop) * scales[v];
             });
 
-            auto hidden = node_to_output.at(qmmi);
             auto reduce_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
             auto mean_h = std::make_shared<ov::op::v1::ReduceMean>(hidden, reduce_axis, true);
             mean_h->set_friendly_name("reduce_mean_h");
@@ -271,51 +307,52 @@ public:
             // Same op sequence as the model's own RMSNorm (Power/ReduceMean/Add/Sqrt/Divide) so
             // the NPU's compute-layers-with-higher-precision list covers it and the square cannot
             // overflow. The norm cancels exactly, so any positive value works and eps is free.
-            const auto f32_scalar = ov::Shape{1, 1, 1};
+            const auto scalar = ov::Shape{};
             auto squared = std::make_shared<ov::op::v1::Power>(
                 centred,
-                ov::op::v0::Constant::create(ov::element::f32, f32_scalar, std::vector<float>{2.0f}));
+                ov::op::v0::Constant::create(compute_type, scalar, std::vector<float>{2.0f}));
             auto mean_squared = std::make_shared<ov::op::v1::ReduceMean>(squared, reduce_axis, true);
             auto biased = std::make_shared<ov::op::v1::Add>(
                 mean_squared,
-                ov::op::v0::Constant::create(ov::element::f32, f32_scalar, std::vector<float>{1e-6f}));
+                ov::op::v0::Constant::create(compute_type, scalar, std::vector<float>{1e-6f}));
             auto rms = std::make_shared<ov::op::v0::Sqrt>(biased);
             const auto sqrt_k = std::sqrt(static_cast<float>(row_size));
             auto inv_norm = std::make_shared<ov::op::v1::Divide>(
-                ov::op::v0::Constant::create(ov::element::f32, f32_scalar, std::vector<float>{1.0f / sqrt_k}),
+                ov::op::v0::Constant::create(compute_type, scalar, std::vector<float>{1.0f / sqrt_k}),
                 rms);
             inv_norm->set_friendly_name("inv_norm_h");
             auto norm = std::make_shared<ov::op::v1::Multiply>(
                 rms,
-                ov::op::v0::Constant::create(ov::element::f32, f32_scalar, std::vector<float>{sqrt_k}));
+                ov::op::v0::Constant::create(compute_type, scalar, std::vector<float>{sqrt_k}));
             norm->set_friendly_name("norm_h");
             auto normed = std::make_shared<ov::op::v1::Multiply>(centred, inv_norm);
             normed->set_friendly_name("normed_h");
 
-            // The Convert must stay foldable into the MatMul so the vocab reaches the device as
-            // i8 - materializing an f16 copy of it is exactly what this pass exists to avoid.
-            auto w_f32 = std::make_shared<ov::op::v0::Convert>(matched_qweight, ov::element::f32);
-            auto new_matmul = std::make_shared<ov::op::v0::MatMul>(normed, w_f32, false, true);
+            // Scale before the MatMul: Multiply(Convert(w), s) is the dequantization pattern the
+            // compiler folds into a native mixed-precision MatMul, so the vocab still reaches the
+            // device as i8 - materializing an f16 copy of it is what this pass exists to avoid.
+            auto converted_weight = std::make_shared<ov::op::v0::Convert>(matched_qweight, compute_type);
+            auto s_cvt = std::make_shared<ov::op::v0::Convert>(matched_qcoeff, compute_type);
+            auto scaled_weight = std::make_shared<ov::op::v1::Multiply>(converted_weight, s_cvt);
+            scaled_weight->set_friendly_name("scale_before_matmul");
+            auto new_matmul = std::make_shared<ov::op::v0::MatMul>(normed, scaled_weight, false, true);
 
-            auto rowsum_const = ov::op::v0::Constant::create(ov::element::f32,
-                                                             ov::Shape{1, 1, static_cast<std::size_t>(vocab_size)},
-                                                             rowsum);
-            auto mean_over_norm = std::make_shared<ov::op::v1::Multiply>(mean_h, inv_norm);
-            auto dc = std::make_shared<ov::op::v1::Multiply>(mean_over_norm, rowsum_const);
-            dc->set_friendly_name("mean_times_rowsum");
-            auto restored = std::make_shared<ov::op::v1::Add>(new_matmul, dc);
-            restored->set_friendly_name("add_after_matmul");
+            // The MatMul output already carries the per-row scale, so undoing the normalization
+            // here reconstructs the logit directly. Doing it the other way round - denormalizing
+            // an unscaled accumulator - would rebuild logits/s, which for a small-scale row can be
+            // far outside f16 range.
+            auto denormed = std::make_shared<ov::op::v1::Multiply>(new_matmul, norm);
+            denormed->set_friendly_name("denorm_after_matmul");
 
-            auto s_f32 = std::make_shared<ov::op::v0::Convert>(matched_qcoeff, ov::element::f32);
-            auto s_reshape =
-                ov::op::v0::Constant::create(ov::element::i64, ov::Shape{3}, std::vector<int64_t>{1, 1, vocab_size});
-            auto scale_reshaped = std::make_shared<ov::op::v1::Reshape>(s_f32, s_reshape, false);
-            auto scaled = std::make_shared<ov::op::v1::Multiply>(restored, scale_reshaped);
-            scaled->set_friendly_name("scale_after_matmul");
-            // Undo the normalization only after the per-row scale: the other order rebuilds
-            // logits/s, which for a small-scale row can be far outside f16 range.
-            auto logits = std::make_shared<ov::op::v1::Multiply>(scaled, norm);
-            logits->set_friendly_name("denorm_after_matmul");
+            // The norm cancels in the correction term (mu/n * rowsum * s * n), so it is left out
+            // of it entirely - dividing by an eps-dominated n would blow the term up for nothing.
+            ov::Shape rowsum_shape(static_cast<std::size_t>(hidden_rank.get_length()), 1);
+            rowsum_shape.back() = static_cast<std::size_t>(vocab_size);
+            auto rowsum_const = ov::op::v0::Constant::create(compute_type, rowsum_shape, rowsum_scaled);
+            auto correction = std::make_shared<ov::op::v1::Multiply>(mean_h, rowsum_const);
+            correction->set_friendly_name("mean_times_rowsum_scale");
+            auto logits = std::make_shared<ov::op::v1::Add>(denormed, correction);
+            logits->set_friendly_name("add_after_matmul");
             // Preserve tensor names (e.g. "logits") from the old MatMul output so consumers keep working.
             logits->output(0).set_names(matched_matmul->output(0).get_names());
 
@@ -419,13 +456,17 @@ bool convert_vocab_to_i8(const std::shared_ptr<ov::Model>& model) {
     return id_converted;
 }
 
-bool apply_matmul_first_vocab(const std::shared_ptr<ov::Model>& model) {
+}  // namespace
+
+bool ov::npuw::apply_matmul_first_vocab(const std::shared_ptr<ov::Model>& model) {
     ov::pass::GraphRewrite rewr;
     rewr.add_matcher<MatMulFirstAsymVocab>();
     auto ran = rewr.run_on_model(model);
     model->validate_nodes_and_infer_types();
     return ran;
 }
+
+namespace {
 
 std::shared_ptr<ov::Model> cut_lm_head(const std::shared_ptr<ov::Model>& model) {
     ov::pass::GraphRewrite rewr;
@@ -537,14 +578,6 @@ std::optional<NPUDesc> extract_npu_descriptor(const std::shared_ptr<const ov::IP
     }
 
     return std::make_optional(std::move(desc));
-}
-
-template <typename T>
-std::optional<T> get_option(const ov::AnyMap& config, const std::string& option_name) {
-    if (auto it = config.find(option_name); it != config.end()) {
-        return std::make_optional(it->second.as<T>());
-    }
-    return std::nullopt;
 }
 
 std::optional<ov::Any> pop_option(ov::AnyMap& config, const std::string& option_name) {
@@ -1177,14 +1210,14 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     ov::npuw::ReplaceDeepstackScatterWithAdd().run_on_model(kvcache_model);
 
-    if (m_cfg.get<::intel_npu::NPUW_LLM_ASYM_I8_VOCAB_AS_INPUT>()) {
-        NPUW_ASSERT(convert_vocab_to_i8(kvcache_model));
+    if (m_cfg.get<::intel_npu::NPUW_LLM_ASYM_VOCAB_AS_INPUT>()) {
+        if (!convert_vocab_to_i8(kvcache_model)) {
+            LOG_INFO("No asymmetric u8 vocab found - i8 vocab conversion is skipped.");
+        }
     }
     auto lm_head_model = check_and_cut_lm_head(kvcache_model, m_cfg);
-    if (lm_head_model) {
-        if (m_cfg.get<::intel_npu::NPUW_LLM_MATMUL_FIRST_VOCAB>()) {
-            NPUW_ASSERT(apply_matmul_first_vocab(lm_head_model));
-        }
+    if (lm_head_model && m_cfg.get<::intel_npu::NPUW_LLM_MATMUL_FIRST_VOCAB>()) {
+        NPUW_ASSERT(ov::npuw::apply_matmul_first_vocab(lm_head_model));
     }
 
     // Detect attention mask type before the SDPA subgraph is isolated by partitioning.
@@ -1605,9 +1638,8 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
         apply_weights_bank_name(lm_head_config, weights_bank_name);
 
-        auto vocab_as_input = get_option<bool>(other_props, std::string("NPUW_ASYM_VOCAB_AS_INPUT"));
-        if (m_cfg.get<::intel_npu::NPUW_LLM_ASYM_I8_VOCAB_AS_INPUT>() ||
-            m_cfg.get<::intel_npu::NPUW_LLM_ASYM_VOCAB_AS_INPUT>()) {
+        // Host gather can't serve the vocab which is passed to the LM head as an input.
+        if (m_cfg.get<::intel_npu::NPUW_LLM_ASYM_VOCAB_AS_INPUT>()) {
             lm_head_config["NPUW_HOST_GATHER"] = "NO";
         }
         m_lm_head_compiled = m_compiled_model_factory(lm_head_model, plugin, lm_head_config);

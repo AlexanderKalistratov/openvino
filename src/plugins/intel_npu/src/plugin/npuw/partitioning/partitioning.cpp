@@ -1599,7 +1599,8 @@ void Partitioner::saveRepeatedConstants(const std::string& func_name) {
 
 void Partitioner::saveTailDictConstants(const std::string& func_name) {
     if (!part_ctx.use_host_gather_quant) {
-        // No need to preserve as constants
+        LOG_DEBUG("Tail dictionary constant preservation skipped for "
+                  << func_name << ": use_host_gather_quant=NO");
         return;
     }
 
@@ -1630,7 +1631,9 @@ void Partitioner::saveTailDictConstants(const std::string& func_name) {
     rewr.run_on_model(model_group.front());
 
     for (auto&& const_to_keep : to_keep) {
-        LOG_DEBUG("[KEEP] " << const_to_keep);
+        LOG_VERB("Tail dictionary preserved Constant: " << const_to_keep->get_friendly_name() << " shape="
+                                                          << const_to_keep->get_shape() << " type="
+                                                          << const_to_keep->get_element_type());
         func_group.consts_to_keep.insert(const_to_keep);
     }
     LOG_VERB("Done");
@@ -1826,6 +1829,10 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
 
                 auto new_param = std::make_shared<ov::op::v0::Parameter>(prod_output.get_element_type(),
                                                                          prod_output.get_partial_shape());
+                // The "npuw_closure_" prefix keeps the name out of the way of the existing
+                // name-based Parameter lookups (attention, pyramid, block KV cache).
+                new_param->set_friendly_name("npuw_closure_" + std::to_string(new_param_idx) + "_" +
+                                             input_node->get_friendly_name());
                 input_desc.replace_source_output(new_param);  // (n)/1/i/a
                 function._model->add_parameters({std::move(new_param)});
                 LOG_DEBUG("Register Parameter[" << new_param_idx << "] as input to " << iport.first << " / "

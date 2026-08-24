@@ -159,6 +159,8 @@ target_sources(${TARGET_NAME} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/npu/option_support_cache_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/llm_compiled_model_graph_options_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/flux2_compiled_model_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/llm_compiled_model_factory_options_test.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/npuw/matmul_first_vocab_accuracy_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/gqa_compiled_model_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/llm_continuation_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/npuw/stored_tokens_state_test.cpp
