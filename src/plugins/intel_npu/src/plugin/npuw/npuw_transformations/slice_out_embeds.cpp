@@ -20,7 +20,14 @@ void slice_out_embeds(std::shared_ptr<ov::Model> model,
     }
 
     if (embed_result) {
-        auto shape = embed_result->input(0).get_shape();
+        // The LM head cut may put a Convert in front of the Result - slice ahead of it so the
+        // conversion runs on the single sliced embedding instead of the whole prefill window.
+        std::shared_ptr<ov::Node> slice_target = embed_result;
+        auto producer = embed_result->input_value(0).get_node_shared_ptr();
+        if (ov::is_type<ov::op::v0::Convert>(producer)) {
+            slice_target = producer;
+        }
+        auto shape = slice_target->input(0).get_shape();
         // If shape.size() is 3, then last axis should contain the rank of embedding dimension.
         // But 1st and 2nd axes can mean different things.
         // 1st axis can represent the batch size, while 2nd - the number of embeddings,
@@ -44,9 +51,10 @@ void slice_out_embeds(std::shared_ptr<ov::Model> model,
                                                                    ov::Shape{3},
                                                                    std::vector<int32_t>{1, 1, 1});
 
-                auto slice = std::make_shared<ov::op::v8::Slice>(embed_result->input_value(0), start, stop, step);
+                auto slice = std::make_shared<ov::op::v8::Slice>(slice_target->input_value(0), start, stop, step);
 
-                embed_result->input(0).replace_source_output(slice);
+                slice_target->input(0).replace_source_output(slice);
+                slice_target->validate_and_infer_types();
                 embed_result->validate_and_infer_types();
                 model->validate_nodes_and_infer_types();
             }

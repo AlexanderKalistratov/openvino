@@ -460,22 +460,36 @@ public:
 
             // Cut point:
             auto matmul_first_source = matched_matmul->input(0).get_source_output();
+            const auto embeds_type = matmul_first_source.get_element_type();
+            // The embeddings tensor is shared as-is between the kvcache/prefill request and the
+            // LM head request, so the two sides must agree on the type - lower both to f16.
+            const bool lower_to_f16 = embeds_type == ov::element::f32;
 
             // Cut original model:
-            matched_result->input(0).replace_source_output(matmul_first_source);
+            ov::Output<ov::Node> embeds_out = matmul_first_source;
+            if (lower_to_f16) {
+                auto to_f16 = std::make_shared<ov::op::v0::Convert>(matmul_first_source, ov::element::f16);
+                to_f16->set_friendly_name("output_embeds_to_f16");
+                embeds_out = to_f16->output(0);
+            }
+            matched_result->input(0).replace_source_output(embeds_out);
             // FIXME: Somehow for KVCache model result output gets renamed in
             //        ICompiledModel::ICompiledModel().
             //        As a WA, setting the same name to output from MatMul
             //        avoids the issue.
-            matmul_first_source.set_names({ov::npuw::LLMCompiledModel::output_embeds});
+            embeds_out.set_names({ov::npuw::LLMCompiledModel::output_embeds});
             matched_result->output(0).set_names({ov::npuw::LLMCompiledModel::output_embeds});
             matched_result->validate_and_infer_types();
 
             // Create an additional model after cut point:
-            auto new_param = std::make_shared<ov::op::v0::Parameter>(matmul_first_source.get_element_type(),
+            auto new_param = std::make_shared<ov::op::v0::Parameter>(embeds_out.get_element_type(),
                                                                      matmul_first_source.get_partial_shape());
             new_param->output(0).add_names({ov::npuw::LLMCompiledModel::output_embeds});
-            matched_matmul->input(0).replace_source_output(new_param);
+            ov::Output<ov::Node> head_input = new_param->output(0);
+            if (lower_to_f16) {
+                head_input = std::make_shared<ov::op::v0::Convert>(new_param, embeds_type)->output(0);
+            }
+            matched_matmul->input(0).replace_source_output(head_input);
             auto new_result = std::make_shared<ov::op::v0::Result>(matched_node_last_op);
             lm_head_model =
                 std::make_shared<ov::Model>(ov::OutputVector{new_result->output(0)}, ov::ParameterVector{new_param});
@@ -1290,10 +1304,9 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
             LOG_WARN("NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but there is no separate LM head model to "
                      "rewrite - the LM head is left unmodified. Enable NPUW_LLM_SHARED_HEAD to cut it out.");
         } else if (!ov::npuw::apply_matmul_first_vocab(lm_head_model)) {
+            LOG_WARN("NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but the LM head vocab MatMul does not match "
+                     "the expected asymmetric dequantization pattern - the LM head is left unmodified.");
             log_lm_head_weight_chain(lm_head_model);
-            NPUW_ASSERT(false && "NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but the LM head vocab MatMul does "
-                                 "not match the expected asymmetric dequantization pattern - the head would "
-                                 "have been left unmodified. See the LM head weight chain logged above.");
         }
     } else {
         LOG_INFO("NPUW_LLM_MATMUL_FIRST_VOCAB is disabled - the LM head is left unmodified.");

@@ -6,6 +6,7 @@
 
 #include "llm_pass_test_fixture.hpp"
 #include "openvino/op/constant.hpp"
+#include "openvino/op/convert.hpp"
 #include "openvino/op/result.hpp"
 #include "openvino/op/slice.hpp"
 
@@ -15,7 +16,8 @@ using ov::test::npuw::RecordingFactory;
 
 class SliceOutEmbedsPassTest : public ov::test::npuw::LLMPassTestFixture {
 protected:
-    // Returns true iff the direct producer of the output_embeds Result is a v8::Slice.
+    // Returns true iff the producer of the output_embeds Result is a v8::Slice, looking through
+    // the f16 Convert the LM head cut puts in front of the Result.
     // This is precisely what SliceOutEmbeds inserts; other Slice ops (e.g. from RoPE
     // half-rotation) are NOT on this path and must not be counted.
     static bool output_embeds_has_slice_producer(const std::shared_ptr<ov::Model>& model) {
@@ -27,6 +29,9 @@ protected:
                     if (!result_node || result_node->inputs().empty())
                         return false;
                     auto producer = result_node->input(0).get_source_output().get_node_shared_ptr();
+                    if (ov::is_type<ov::op::v0::Convert>(producer)) {
+                        producer = producer->input(0).get_source_output().get_node_shared_ptr();
+                    }
                     return ov::is_type<ov::op::v8::Slice>(producer);
                 }
             }
