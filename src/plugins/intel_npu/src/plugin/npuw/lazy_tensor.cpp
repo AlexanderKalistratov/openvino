@@ -369,36 +369,23 @@ void Gather::detach() {
     w.detach();
 }
 
-std::size_t SubRows::hash() const {
+std::size_t Sub128::hash() const {
     std::size_t seed = std::hash<std::size_t>()(7u) + 0x9e3779b9;
     seed ^= tensor.get_hash() + 0x9e3779b9;
-    if (shift) {
-        const auto* c = shift.data<int32_t>();
-        for (std::size_t i = 0, n = shift.get_size(); i < n; ++i) {
-            seed ^= std::hash<int32_t>()(c[i]) + 0x9e3779b9;
-        }
-    }
     return seed;
 }
 
-bool SubRows::operator==(const SubRows& other) const {
-    if (tensor != other.tensor || static_cast<bool>(shift) != static_cast<bool>(other.shift)) {
-        return false;
-    }
-    if (!shift) {
-        return true;
-    }
-    return shift.get_element_type() == other.shift.get_element_type() && shift.get_shape() == other.shift.get_shape() &&
-           std::memcmp(shift.data(), other.shift.data(), shift.get_byte_size()) == 0;
+bool Sub128::operator==(const Sub128& other) const {
+    return tensor == other.tensor;
 }
 
-ov::Tensor SubRows::eval() const {
+ov::Tensor Sub128::eval() const {
     ov::Tensor dst(ov::element::i8, eval_meta().shape);
     eval_into(dst);
     return dst;
 }
 
-void SubRows::eval_into(ov::Tensor& dst) const {
+void Sub128::eval_into(ov::Tensor& dst) const {
     const auto trs = tensor.get_transformations();
 
     ov::Tensor src;
@@ -416,35 +403,32 @@ void SubRows::eval_into(ov::Tensor& dst) const {
     NPUW_ASSERT(src_type == ov::element::u8 || src_type == ov::element::i8);
     NPUW_ASSERT(dst.get_element_type() == ov::element::i8 && dst.get_shape() == src.get_shape());
 
-    const auto rows = shift.get_size();
-    const auto total = src.get_size();
-    NPUW_ASSERT(rows > 0 && total % rows == 0);
-    const auto row_size = total / rows;
-
     const auto* s = static_cast<const uint8_t*>(src.data());
-    const auto* c = shift.data<int32_t>();
     auto* d = dst.data<int8_t>();
+    const auto total = src.get_size();
+
     // The source bytes are the ORIGINAL u8 codes (the graph-level Constant only
     // reinterprets them as i8), so widen through uint8_t before subtracting.
-    ov::parallel_for(rows, [&](std::size_t r) {
-        const auto* src_row = s + r * row_size;
-        auto* dst_row = d + r * row_size;
-        const auto c_r = c[r];
-        for (std::size_t i = 0; i < row_size; ++i) {
-            dst_row[i] = static_cast<int8_t>(static_cast<int32_t>(src_row[i]) - c_r);
+    constexpr std::size_t chunk_size = 1u << 20;
+    const auto chunks = (total + chunk_size - 1) / chunk_size;
+    ov::parallel_for(chunks, [&](std::size_t c) {
+        const auto begin = c * chunk_size;
+        const auto end = std::min(begin + chunk_size, total);
+        for (std::size_t i = begin; i < end; ++i) {
+            d[i] = static_cast<int8_t>(static_cast<int32_t>(s[i]) - 128);
         }
     });
 }
 
-LazyTensor::Meta SubRows::eval_meta() const {
+LazyTensor::Meta Sub128::eval_meta() const {
     return {tensor.eval_meta().shape, ov::element::i8};
 }
 
-void SubRows::read_weight(const ov::npuw::s11n::WeightsContext& ctx) {
+void Sub128::read_weight(const ov::npuw::s11n::WeightsContext& ctx) {
     tensor.read_weight(ctx);
 }
 
-void SubRows::detach() {
+void Sub128::detach() {
     tensor.detach();
 }
 
@@ -460,7 +444,7 @@ enum class TransformType : std::uint16_t {
     PERMUTE = 4,
     CONVERT = 5,
     GATHER = 6,
-    SUB_ROWS = 7,
+    SUB128 = 7,
 };
 
 struct LazyTensorImpl {
@@ -524,8 +508,8 @@ ov::npuw::weights::TransformType get_transform_type(const ov::npuw::weights::op:
     return ov::npuw::weights::TransformType::GATHER;
 }
 
-ov::npuw::weights::TransformType get_transform_type(const ov::npuw::weights::op::SubRows&) {
-    return ov::npuw::weights::TransformType::SUB_ROWS;
+ov::npuw::weights::TransformType get_transform_type(const ov::npuw::weights::op::Sub128&) {
+    return ov::npuw::weights::TransformType::SUB128;
 }
 
 }  // namespace
@@ -598,8 +582,8 @@ void Gather::serialize(ov::npuw::orc::Stream& stream) {
     }
 }
 
-void SubRows::serialize(ov::npuw::orc::Stream& stream) {
-    stream & tensor & shift;
+void Sub128::serialize(ov::npuw::orc::Stream& stream) {
+    stream & tensor;
 }
 
 }  // namespace op
@@ -639,8 +623,8 @@ void LazyTensorImpl::serialize(ov::npuw::orc::Stream& stream) {
     case TransformType::GATHER:
         m_transform.emplace<op::Gather>(ov::npuw::orc::load_versioned_payload<op::Gather>(section));
         break;
-    case TransformType::SUB_ROWS:
-        m_transform.emplace<op::SubRows>(ov::npuw::orc::load_versioned_payload<op::SubRows>(section));
+    case TransformType::SUB128:
+        m_transform.emplace<op::Sub128>(ov::npuw::orc::load_versioned_payload<op::Sub128>(section));
         break;
     default:
         OPENVINO_THROW("ORC LazyTensor: unknown op_type ", section.type, " — please upgrade NPUW");
@@ -712,7 +696,7 @@ LazyTensor::Meta LazyTensorImpl::eval_meta() const {
 }
 
 void LazyTensorImpl::eval_into(ov::Tensor& dst) const {
-    std::visit(overloaded{[&dst](const op::SubRows& op) {
+    std::visit(overloaded{[&dst](const op::Sub128& op) {
                               op.eval_into(dst);
                           },
                           [&dst](const auto& op) {
@@ -764,7 +748,7 @@ void LazyTensorImpl::get_transformations(std::vector<LazyTensor::Transform>& vec
                        auto next_tr = op.w.get_transformations();
                        vec.insert(vec.end(), next_tr.begin(), next_tr.end());
                    },
-                   [&vec](const op::SubRows& op) {
+                   [&vec](const op::Sub128& op) {
                        auto next_tr = op.tensor.get_transformations();
                        vec.insert(vec.end(), next_tr.begin(), next_tr.end());
                    },
@@ -807,9 +791,9 @@ LazyTensor LazyTensor::convert(const ov::element::Type& type) {
     return new_lt;
 }
 
-LazyTensor LazyTensor::sub_rows(const ov::Tensor& shift) {
+LazyTensor LazyTensor::sub128() {
     LazyTensor new_lt;
-    new_lt.m_impl = std::make_shared<LazyTensorImpl>(op::SubRows(*this, shift));
+    new_lt.m_impl = std::make_shared<LazyTensorImpl>(op::Sub128(*this));
     return new_lt;
 }
 

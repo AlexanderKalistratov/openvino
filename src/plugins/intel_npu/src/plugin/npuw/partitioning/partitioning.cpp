@@ -1766,10 +1766,9 @@ ov::npuw::weights::LazyTensor put_to_closure(const std::shared_ptr<ov::Node>& in
     auto const_node = std::static_pointer_cast<ov::op::v0::Constant>(input_node);
     ov::npuw::weights::LazyTensor lt(const_node);
     const auto& rt_info = const_node->get_rt_info();
-    auto shift_it = rt_info.find(ov::npuw::weights::op::SubRows::rt_key);
-    if (shift_it != rt_info.end()) {
-        LOG_DEBUG("SubRows marker found on " << const_node->get_friendly_name() << " - applying to the LazyTensor");
-        lt = lt.sub_rows(shift_it->second.as<ov::Tensor>());
+    if (rt_info.count(ov::npuw::weights::op::Sub128::rt_key) > 0) {
+        LOG_DEBUG("Sub128 marker found on " << const_node->get_friendly_name() << " - applying to the LazyTensor");
+        lt = lt.sub128();
     }
     return lt;
 }
@@ -1843,11 +1842,11 @@ void Partitioner::createFunction(FunctionPipeline& func_ggg) {
                 LOG_DEBUG("Register " << prod_output << " in the function closure");
                 funcall._lazy_closure.push_back(put_to_closure(input_node));  // (n)/1/i/c
             } else if (ov::op::util::is_constant(input_node) &&
-                       input_node->get_rt_info().count(ov::npuw::weights::op::SubRows::rt_key) > 0) {
-                // A SubRows-marked Constant landed in consts_to_keep and stays inline
+                       input_node->get_rt_info().count(ov::npuw::weights::op::Sub128::rt_key) > 0) {
+                // A Sub128-marked Constant landed in consts_to_keep and stays inline
                 // in the function body - the shift would be silently skipped there,
                 // producing wrong numerics. Fail loudly instead.
-                OPENVINO_THROW("NPUW: SubRows-marked Constant ",
+                OPENVINO_THROW("NPUW: Sub128-marked Constant ",
                                input_node->get_friendly_name(),
                                " is kept in the function body and won't be transformed");
             } else if (ov::op::util::is_parameter(input_node)) {

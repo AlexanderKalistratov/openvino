@@ -133,7 +133,7 @@ public:
 
                 const auto& qweight_shape = matched_qweight_const->get_shape();
                 const auto& qzerop_shape = matched_qzerop_const->get_shape();
-                // The shift below is per vocab entry, so the zero point must be per vocab entry too
+                // MatMulFirstAsymVocab, the pass this one feeds, needs a per-vocab-entry zero point
                 if (matched_qzerop_const->get_element_type() != ov::element::u8 || qzerop_shape.size() != 2 ||
                     qzerop_shape[0] != qweight_shape[0] || qzerop_shape[1] != 1) {
                     LOG_VERB("ConvertVocabAsymU8ToI8: skip "
@@ -143,34 +143,14 @@ public:
                     return false;
                 }
 
-                // Per vocab entry shift c[v], applied to both the vocab row and its zero point.
-                // Any c cancels out - (w - c) - (z - c) == w - z - so this stays bit-exact; a
-                // per-entry c centres the row around zero instead of merely mapping it into the
-                // i8 range, which is what keeps the MatMul-first form (see MatMulFirstAsymVocab)
-                // from having to cancel two large terms against each other.
-                //
-                // c[v] = (min + max + 1) / 2 taken over the row's weights AND its zero point.
-                // With every input in [0, 255] the row span d = max - min is at most 255, and
-                // rounding the midpoint UP gives max - c <= 127 and min - c >= -128 for every d,
-                // so neither the shifted weights nor the shifted zero point can overflow i8.
-                // (Rounding down instead - (min + max) / 2 - would yield max - c == 128 at d = 255.)
-                const auto vocab_size = qweight_shape[0];
-                const auto row_size = qweight_shape[1];
-                const auto* qweight_data = static_cast<const uint8_t*>(matched_qweight_const->get_data_ptr());
-                const auto* qzerop_data = static_cast<const uint8_t*>(matched_qzerop_const->get_data_ptr());
-
-                ov::Tensor shift(ov::element::i32, ov::Shape{vocab_size});
-                auto* shift_data = shift.data<int32_t>();
-                ov::parallel_for(vocab_size, [&](std::size_t v) {
-                    const auto* row = qweight_data + v * row_size;
-                    uint8_t lo = qzerop_data[v];
-                    uint8_t hi = qzerop_data[v];
-                    for (std::size_t i = 0; i < row_size; ++i) {
-                        lo = std::min(lo, row[i]);
-                        hi = std::max(hi, row[i]);
-                    }
-                    shift_data[v] = (static_cast<int32_t>(lo) + static_cast<int32_t>(hi) + 1) / 2;
-                });
+                // Shift both the vocab rows and the zero point by 128. Any common shift cancels -
+                // (w - 128) - (z - 128) == w - z - so this is bit-exact, and since every input is
+                // u8 the result lands in [-128, 127] by construction: it IS the u8 -> i8
+                // reinterpretation. A per-row shift was tried instead and reverted: to shrink the
+                // MatMul-first accumulator the shift would have to track the zero point z, but z
+                // can sit anywhere in [0, 255] while w - z needs [-255, 255], so no integer shift
+                // can both fit i8 and cancel it. That job belongs to the mean-centred activation
+                // (see MatMulFirstAsymVocab), which cancels the zero point for ANY shift.
 
                 auto reinterpret_u8_as_i8 = [](const std::shared_ptr<ov::op::v0::Constant>& src) {
                     OPENVINO_ASSERT(src->get_element_type() == ov::element::u8);
@@ -193,19 +173,19 @@ public:
                 };
 
                 // To not allocate a shifted copy of the vocab here, the shifting itself is deferred
-                // to the LazyTensor unpacking stage (only the min/max scan above reads the weight).
+                // to the LazyTensor unpacking stage - nothing reads the weight at compile time.
                 auto i8_qweight_constant = reinterpret_u8_as_i8(matched_qweight_const);
                 // Inform partitioning, that this Const is special and needs to be unpacked with
-                // the per vocab entry shift applied.
-                i8_qweight_constant->get_rt_info()[ov::npuw::weights::op::SubRows::rt_key] = shift;
+                // the -128 shift applied.
+                i8_qweight_constant->get_rt_info()[ov::npuw::weights::op::Sub128::rt_key] = true;
                 ov::replace_node(matched_qweight_const, i8_qweight_constant);
                 auto i8_qzerop_constant = reinterpret_u8_as_i8(matched_qzerop_const);
-                // The zero point is shifted by the very same per-entry value, so that
-                // (w - c) - (z - c) reproduces the original w - z exactly.
-                i8_qzerop_constant->get_rt_info()[ov::npuw::weights::op::SubRows::rt_key] = shift;
+                // The zero point is shifted by the very same value, so that
+                // (w - 128) - (z - 128) reproduces the original w - z exactly.
+                i8_qzerop_constant->get_rt_info()[ov::npuw::weights::op::Sub128::rt_key] = true;
                 ov::replace_node(matched_qzerop_const, i8_qzerop_constant);
                 LOG_INFO("ConvertVocabAsymU8ToI8: vocab " << matched_qweight->get_friendly_name() << " "
-                                                          << qweight_shape << " reinterpreted as i8 with a per-row "
+                                                          << qweight_shape << " reinterpreted as i8 with a -128 "
                                                           << "shift; it will be passed to the LM head as an input.");
                 return true;
             }
@@ -310,11 +290,11 @@ public:
             // the "scale after the MatMul" of the pair, folded into a constant at compile time so
             // that the scale Constant keeps a single consumer (the DQ Multiply on the weight) and
             // the raw rowsum, which can reach 2 * K * 255, never has to survive in f16.
-            // Both quantized constants carry the same per-row shift (if any) and the expression is
-            // invariant to it, so raw values will do - but a SubRows-marked Constant still holds
+            // Both quantized constants carry the same -128 shift (if any) and the expression is
+            // invariant to it, so raw values will do - but a Sub128-marked Constant still holds
             // unshifted u8 codes behind an i8 type.
             const bool as_u8 = matched_qweight->get_element_type() == ov::element::u8 ||
-                               matched_qweight->get_rt_info().count(ov::npuw::weights::op::SubRows::rt_key) > 0;
+                               matched_qweight->get_rt_info().count(ov::npuw::weights::op::Sub128::rt_key) > 0;
             const auto* qweight_data = static_cast<const uint8_t*>(
                 std::static_pointer_cast<ov::op::v0::Constant>(matched_qweight)->get_data_ptr());
             const auto* qzerop_data = static_cast<const uint8_t*>(
