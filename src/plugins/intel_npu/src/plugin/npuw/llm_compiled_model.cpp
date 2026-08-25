@@ -111,9 +111,13 @@ public:
 
             auto matched_qweight = node_to_output.at(qweight).get_node_shared_ptr();
             if (matched_qweight->get_element_type() != ov::element::u8) {
+                LOG_VERB("ConvertVocabAsymU8ToI8: skip " << matched_qweight->get_friendly_name() << " - weight is "
+                                                         << matched_qweight->get_element_type() << ", expected u8");
                 return false;
             }
             if (matched_qweight->get_shape().size() != 2) {
+                LOG_VERB("ConvertVocabAsymU8ToI8: skip " << matched_qweight->get_friendly_name() << " - weight shape "
+                                                         << matched_qweight->get_shape() << " is not 2D");
                 return false;
             }
             auto matched_qcoeff = node_to_output.at(qcoeff).get_node_shared_ptr();
@@ -132,6 +136,10 @@ public:
                 // The shift below is per vocab entry, so the zero point must be per vocab entry too
                 if (matched_qzerop_const->get_element_type() != ov::element::u8 || qzerop_shape.size() != 2 ||
                     qzerop_shape[0] != qweight_shape[0] || qzerop_shape[1] != 1) {
+                    LOG_VERB("ConvertVocabAsymU8ToI8: skip "
+                             << matched_qweight->get_friendly_name() << " - zero point is "
+                             << matched_qzerop_const->get_element_type() << " " << qzerop_shape << ", expected u8 ["
+                             << qweight_shape[0] << ",1]");
                     return false;
                 }
 
@@ -196,8 +204,15 @@ public:
                 // (w - c) - (z - c) reproduces the original w - z exactly.
                 i8_qzerop_constant->get_rt_info()[ov::npuw::weights::op::SubRows::rt_key] = shift;
                 ov::replace_node(matched_qzerop_const, i8_qzerop_constant);
+                LOG_INFO("ConvertVocabAsymU8ToI8: vocab " << matched_qweight->get_friendly_name() << " "
+                                                          << qweight_shape << " reinterpreted as i8 with a per-row "
+                                                          << "shift; it will be passed to the LM head as an input.");
                 return true;
             }
+            LOG_VERB("ConvertVocabAsymU8ToI8: skip "
+                     << matched_qweight->get_friendly_name() << " - scale shape " << qcoeff_shape
+                     << " (expected [V,1]) or MatMul transpose_a=" << matched_matmul->get_transpose_a()
+                     << " transpose_b=" << matched_matmul->get_transpose_b() << " (expected false/true)");
             return false;
         };
         register_matcher(std::make_shared<opp::Matcher>(p.qres, "ConvertVocabAsymU8ToI8"), std::move(callback));
@@ -234,9 +249,14 @@ public:
             auto matched_qweight = node_to_output.at(qweight).get_node_shared_ptr();
             if (matched_qweight->get_element_type() != ov::element::u8 &&
                 matched_qweight->get_element_type() != ov::element::i8) {
+                LOG_WARN("MatMulFirstAsymVocab: skip " << matched_qweight->get_friendly_name() << " - weight is "
+                                                       << matched_qweight->get_element_type()
+                                                       << ", expected u8 or i8");
                 return false;
             }
             if (matched_qweight->get_shape().size() != 2) {
+                LOG_WARN("MatMulFirstAsymVocab: skip " << matched_qweight->get_friendly_name() << " - weight shape "
+                                                       << matched_qweight->get_shape() << " is not 2D");
                 return false;
             }
 
@@ -250,6 +270,10 @@ public:
 
             if (qcoeff_shape.size() != 2 || qcoeff_shape[1] != 1 || matched_matmul->get_transpose_a() ||
                 !matched_matmul->get_transpose_b()) {
+                LOG_WARN("MatMulFirstAsymVocab: skip "
+                         << matched_qweight->get_friendly_name() << " - scale shape " << qcoeff_shape
+                         << " (expected [V,1]) or MatMul transpose_a=" << matched_matmul->get_transpose_a()
+                         << " transpose_b=" << matched_matmul->get_transpose_b() << " (expected false/true)");
                 return false;
             }
 
@@ -257,12 +281,18 @@ public:
             const auto& qzerop_shape = matched_qzerop->get_shape();
             if (matched_qzerop->get_element_type() != matched_qweight->get_element_type() || qzerop_shape.size() != 2 ||
                 qzerop_shape[0] != qweight_shape[0] || qzerop_shape[1] != 1) {
+                LOG_WARN("MatMulFirstAsymVocab: skip "
+                         << matched_qweight->get_friendly_name() << " - zero point is "
+                         << matched_qzerop->get_element_type() << " " << qzerop_shape << ", expected "
+                         << matched_qweight->get_element_type() << " [" << qweight_shape[0] << ",1]");
                 return false;
             }
 
             auto hidden = node_to_output.at(qmmi);
             const auto hidden_rank = hidden.get_partial_shape().rank();
             if (hidden_rank.is_dynamic()) {
+                LOG_WARN("MatMulFirstAsymVocab: skip " << matched_qweight->get_friendly_name()
+                                                       << " - activation rank is dynamic");
                 return false;
             }
             const auto compute_type = hidden.get_element_type();
@@ -346,10 +376,15 @@ public:
 
             // The norm cancels in the correction term (mu/n * rowsum * s * n), so it is left out
             // of it entirely - dividing by an eps-dominated n would blow the term up for nothing.
+            // Kept in f16 so it crosses to the device as an f16 input, like the other closures.
             ov::Shape rowsum_shape(static_cast<std::size_t>(hidden_rank.get_length()), 1);
             rowsum_shape.back() = static_cast<std::size_t>(vocab_size);
-            auto rowsum_const = ov::op::v0::Constant::create(compute_type, rowsum_shape, rowsum_scaled);
-            auto correction = std::make_shared<ov::op::v1::Multiply>(mean_h, rowsum_const);
+            auto rowsum_const = ov::op::v0::Constant::create(ov::element::f16, rowsum_shape, rowsum_scaled);
+            std::shared_ptr<ov::Node> rowsum_in = rowsum_const;
+            if (compute_type != ov::element::f16) {
+                rowsum_in = std::make_shared<ov::op::v0::Convert>(rowsum_const, compute_type);
+            }
+            auto correction = std::make_shared<ov::op::v1::Multiply>(mean_h, rowsum_in);
             correction->set_friendly_name("mean_times_rowsum_scale");
             auto logits = std::make_shared<ov::op::v1::Add>(denormed, correction);
             logits->set_friendly_name("add_after_matmul");
@@ -357,6 +392,10 @@ public:
             logits->output(0).set_names(matched_matmul->output(0).get_names());
 
             matched_result->input(0).replace_source_output(logits->output(0));
+            LOG_INFO("MatMulFirstAsymVocab: LM head rewritten - vocab "
+                     << matched_qweight->get_friendly_name() << " " << qweight_shape << " "
+                     << matched_qweight->get_element_type() << " goes into the MatMul scaled but not dequantized"
+                     << ", activation is mean-centred and L2-normalized (compute type " << compute_type << ").");
             return true;
         };
         register_matcher(std::make_shared<opp::Matcher>(qres, "MatMulFirstAsymVocab"), std::move(callback));
@@ -467,6 +506,32 @@ bool ov::npuw::apply_matmul_first_vocab(const std::shared_ptr<ov::Model>& model)
 }
 
 namespace {
+
+// Reports what actually feeds each LM head MatMul's weight input, so that a miss of
+// AsymVocabPattern can be told from the expected chain at a glance.
+void log_lm_head_weight_chain(const std::shared_ptr<ov::Model>& model) {
+    for (const auto& node : model->get_ordered_ops()) {
+        if (!ov::is_type<ov::op::v0::MatMul>(node)) {
+            continue;
+        }
+        std::stringstream chain;
+        auto src = node->input_value(1).get_node_shared_ptr();
+        for (std::size_t depth = 0; depth < 8 && src && src->get_output_size() > 0; ++depth) {
+            chain << " <- " << src->get_type_name() << "(" << src->get_output_element_type(0) << " "
+                  << src->get_output_partial_shape(0) << ")";
+            if (src->get_input_size() == 0) {
+                break;
+            }
+            src = src->input_value(0).get_node_shared_ptr();
+        }
+        LOG_WARN("LM head " << node->get_friendly_name() << " transpose_a="
+                            << ov::as_type_ptr<ov::op::v0::MatMul>(node)->get_transpose_a() << " transpose_b="
+                            << ov::as_type_ptr<ov::op::v0::MatMul>(node)->get_transpose_b()
+                            << ", weight input:" << chain.str());
+        LOG_WARN("  expected: <- Convert <- Multiply <- Subtract <- Convert <- Constant(u8 or i8, 2D), "
+                 "transpose_a=0 transpose_b=1");
+    }
+}
 
 std::shared_ptr<ov::Model> cut_lm_head(const std::shared_ptr<ov::Model>& model) {
     ov::pass::GraphRewrite rewr;
@@ -1212,12 +1277,26 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
 
     if (m_cfg.get<::intel_npu::NPUW_LLM_ASYM_VOCAB_AS_INPUT>()) {
         if (!convert_vocab_to_i8(kvcache_model)) {
-            LOG_INFO("No asymmetric u8 vocab found - i8 vocab conversion is skipped.");
+            LOG_WARN("NPUW_LLM_ASYM_VOCAB_AS_INPUT is enabled, but no asymmetric u8 vocab was found - "
+                     "the i8 vocab conversion is skipped. Run with OPENVINO_NPUW_LOG_LEVEL=VERBOSE "
+                     "to see why the pattern did not match.");
         }
+    } else {
+        LOG_INFO("NPUW_LLM_ASYM_VOCAB_AS_INPUT is disabled - the vocab stays a dequantized constant.");
     }
     auto lm_head_model = check_and_cut_lm_head(kvcache_model, m_cfg);
-    if (lm_head_model && m_cfg.get<::intel_npu::NPUW_LLM_MATMUL_FIRST_VOCAB>()) {
-        NPUW_ASSERT(ov::npuw::apply_matmul_first_vocab(lm_head_model));
+    if (m_cfg.get<::intel_npu::NPUW_LLM_MATMUL_FIRST_VOCAB>()) {
+        if (!lm_head_model) {
+            LOG_WARN("NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but there is no separate LM head model to "
+                     "rewrite - the LM head is left unmodified. Enable NPUW_LLM_SHARED_HEAD to cut it out.");
+        } else if (!ov::npuw::apply_matmul_first_vocab(lm_head_model)) {
+            log_lm_head_weight_chain(lm_head_model);
+            NPUW_ASSERT(false && "NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but the LM head vocab MatMul does "
+                                 "not match the expected asymmetric dequantization pattern - the head would "
+                                 "have been left unmodified. See the LM head weight chain logged above.");
+        }
+    } else {
+        LOG_INFO("NPUW_LLM_MATMUL_FIRST_VOCAB is disabled - the LM head is left unmodified.");
     }
 
     // Detect attention mask type before the SDPA subgraph is isolated by partitioning.
