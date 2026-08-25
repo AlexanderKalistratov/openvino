@@ -393,6 +393,12 @@ bool SubRows::operator==(const SubRows& other) const {
 }
 
 ov::Tensor SubRows::eval() const {
+    ov::Tensor dst(ov::element::i8, eval_meta().shape);
+    eval_into(dst);
+    return dst;
+}
+
+void SubRows::eval_into(ov::Tensor& dst) const {
     const auto trs = tensor.get_transformations();
 
     ov::Tensor src;
@@ -408,13 +414,13 @@ ov::Tensor SubRows::eval() const {
 
     const auto src_type = src.get_element_type();
     NPUW_ASSERT(src_type == ov::element::u8 || src_type == ov::element::i8);
+    NPUW_ASSERT(dst.get_element_type() == ov::element::i8 && dst.get_shape() == src.get_shape());
 
     const auto rows = shift.get_size();
     const auto total = src.get_size();
     NPUW_ASSERT(rows > 0 && total % rows == 0);
     const auto row_size = total / rows;
 
-    ov::Tensor dst(ov::element::i8, src.get_shape());
     const auto* s = static_cast<const uint8_t*>(src.data());
     const auto* c = shift.data<int32_t>();
     auto* d = dst.data<int8_t>();
@@ -428,7 +434,6 @@ ov::Tensor SubRows::eval() const {
             dst_row[i] = static_cast<int8_t>(static_cast<int32_t>(src_row[i]) - c_r);
         }
     });
-    return dst;
 }
 
 LazyTensor::Meta SubRows::eval_meta() const {
@@ -464,6 +469,7 @@ struct LazyTensorImpl {
     bool operator==(const LazyTensorImpl& other) const;
 
     ov::Tensor eval() const;
+    void eval_into(ov::Tensor& dst) const;
     LazyTensor::Meta eval_meta() const;
     std::size_t get_hash() const;
     void get_transformations(std::vector<LazyTensor::Transform>& vec) const;
@@ -705,6 +711,16 @@ LazyTensor::Meta LazyTensorImpl::eval_meta() const {
                       m_transform);
 }
 
+void LazyTensorImpl::eval_into(ov::Tensor& dst) const {
+    std::visit(overloaded{[&dst](const op::SubRows& op) {
+                              op.eval_into(dst);
+                          },
+                          [&dst](const auto& op) {
+                              op.eval().copy_to(dst);
+                          }},
+               m_transform);
+}
+
 void LazyTensorImpl::read_weight(const ov::npuw::s11n::WeightsContext& ctx) {
     std::visit(overloaded{[&ctx](auto& op) {
                    return op.read_weight(ctx);
@@ -816,6 +832,11 @@ ov::Tensor LazyTensor::eval() const {
         return ov::Tensor();
     }
     return m_impl->eval();
+}
+
+void LazyTensor::eval_into(ov::Tensor& dst) const {
+    NPUW_ASSERT(m_impl && "Trying to evaluate an uninitialized tensor!");
+    m_impl->eval_into(dst);
 }
 
 LazyTensor::Meta LazyTensor::eval_meta() const {

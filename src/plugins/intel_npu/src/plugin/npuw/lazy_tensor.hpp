@@ -67,6 +67,10 @@ public:
     bool operator!=(const LazyTensor& other) const;
 
     ov::Tensor eval() const;
+    // Materializes straight into dst. eval() allocates a full-size temporary that the caller
+    // then copies away - for a 600 MB vocab that temporary is the whole point of avoiding.
+    // Transforms with no in-place form fall back to eval() + copy.
+    void eval_into(ov::Tensor& dst) const;
     std::size_t get_hash() const;
     std::vector<Transform> get_transformations() const;
     void detach();
@@ -263,6 +267,7 @@ public:
     std::size_t hash() const;
     bool operator==(const SubRows& other) const;
     ov::Tensor eval() const;
+    void eval_into(ov::Tensor& dst) const;
     LazyTensor::Meta eval_meta() const;
     void read_weight(const ov::npuw::s11n::WeightsContext& ctx);
     void detach();
