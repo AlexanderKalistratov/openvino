@@ -21,6 +21,8 @@ public:
         static constexpr const char* position_ids = "position_ids";
         static constexpr const char* past_key_values = "past_key_values";
         static constexpr const char* output_embeds = "npuw_output_embed";
+        static constexpr const char* lm_head_mean = "npuw_lm_head_mean";
+        static constexpr const char* lm_head_norm = "npuw_lm_head_norm";
         static constexpr const char* logits = "logits";
         static constexpr const char* token_type_ids = ov::npuw::util::kTokenTypeIdsParamName;
         static constexpr const char* longrope_input = "npuw_longrope_input";

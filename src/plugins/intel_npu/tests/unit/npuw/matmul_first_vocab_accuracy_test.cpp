@@ -102,8 +102,37 @@ float evaluate_scalar(const std::shared_ptr<ov::Model>& model) {
         hidden_data[k] = ov::float16(hidden_at(k));
     }
 
+    ov::TensorVector inputs{hidden};
+
+    // The rewritten head takes its activation already mean-centred and L2-normalized, plus the
+    // mean and the norm that were taken out of it - the host does this in
+    // LLMInferRequest::prepare_lm_head_input(). Recomputed here so the test exercises the graph
+    // against an independent implementation of the split.
+    if (model->inputs().size() > 1) {
+        float sum = 0.0f;
+        for (std::size_t k = 0; k < kHiddenSize; ++k) {
+            sum += static_cast<float>(hidden_data[k]);
+        }
+        const float mu = sum / static_cast<float>(kHiddenSize);
+        float sum_sq = 0.0f;
+        for (std::size_t k = 0; k < kHiddenSize; ++k) {
+            const float centred = static_cast<float>(hidden_data[k]) - mu;
+            sum_sq += centred * centred;
+        }
+        const float n = std::sqrt(sum_sq);
+        for (std::size_t k = 0; k < kHiddenSize; ++k) {
+            hidden_data[k] = ov::float16((static_cast<float>(hidden_data[k]) - mu) / n);
+        }
+
+        ov::Tensor mean(ov::element::f16, ov::Shape{1, 1});
+        mean.data<ov::float16>()[0] = ov::float16(mu);
+        ov::Tensor norm(ov::element::f16, ov::Shape{1, 1});
+        norm.data<ov::float16>()[0] = ov::float16(n);
+        inputs.push_back(mean);
+        inputs.push_back(norm);
+    }
+
     ov::Tensor output(ov::element::f16, ov::Shape{1, 1});
-    const ov::TensorVector inputs{hidden};
     ov::TensorVector outputs{output};
     OPENVINO_ASSERT(model->evaluate(outputs, inputs));
     return static_cast<float>(outputs.front().data<const ov::float16>()[0]);

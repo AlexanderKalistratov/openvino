@@ -5,6 +5,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 
 #include "base_sync_infer_request.hpp"
 #include "llm_compiled_model.hpp"
@@ -103,6 +104,11 @@ protected:
                         ov::SoPtr<ov::ITensor> position_ids,
                         ov::SoPtr<ov::ITensor> per_layer_inputs);
 
+    // Host counterpart of the MatMul-first LM head rewrite (apply_matmul_first_vocab): mean-centres
+    // and L2-normalizes the embeddings in place and fills the head's per-row mean/norm inputs.
+    // A no-op when the head was not rewritten.
+    void prepare_lm_head_input();
+
     // Multiple generate inference request variants, each with a different KV cache size
     std::vector<std::shared_ptr<ov::IAsyncInferRequest>> m_generate_requests;
 
@@ -136,6 +142,10 @@ protected:
     std::unordered_map<std::shared_ptr<ov::IAsyncInferRequest>, PortsMap> m_generate_variant_out_ports;
 
     ov::Output<const ov::Node> m_lm_head_logits_port;
+    ov::Output<const ov::Node> m_lm_head_embeds_port;
+    // Set only when the head was rewritten by apply_matmul_first_vocab().
+    std::optional<ov::Output<const ov::Node>> m_lm_head_mean_port;
+    std::optional<ov::Output<const ov::Node>> m_lm_head_norm_port;
 
     std::vector<std::string> m_kvcache_past_names;
     std::vector<std::string> m_lincache_past_names;

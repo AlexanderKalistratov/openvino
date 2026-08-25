@@ -333,8 +333,14 @@ ov::npuw::LLMInferRequest::LLMInferRequest(const std::shared_ptr<ov::npuw::LLMCo
     if (compiled_model->m_lm_head_compiled) {
         m_lm_head_request = compiled_model->m_lm_head_compiled->create_infer_request();
         OPENVINO_ASSERT(m_lm_head_request);
-        const ov::Output<const ov::Node> lm_head_embed_port = m_lm_head_request->get_inputs()[0];
+        const auto& lm_head_inputs = m_lm_head_request->get_inputs();
+        const ov::Output<const ov::Node> lm_head_embed_port = lm_head_inputs[0];
+        m_lm_head_embeds_port = lm_head_embed_port;
         m_lm_head_logits_port = m_lm_head_request->get_outputs()[0];
+        // Present only if apply_matmul_first_vocab() rewrote the head: it then expects the
+        // activation already mean-centred and L2-normalized, plus the mean and norm it removed.
+        m_lm_head_mean_port = ov::npuw::util::find_port_by_name(lm_head_inputs, layer_names::lm_head_mean);
+        m_lm_head_norm_port = ov::npuw::util::find_port_by_name(lm_head_inputs, layer_names::lm_head_norm);
         m_prefill_request->set_tensor(m_prefill_out_ports.at(layer_names::output_embeds),
                                       m_lm_head_request->get_tensor(lm_head_embed_port));
 
@@ -1165,6 +1171,65 @@ void ov::npuw::LLMInferRequest::infer_whole_prefill(ov::SoPtr<ov::ITensor> input
     LOG_DEBUG("Done");
 }
 
+namespace {
+// Splits each row into mu, n and q = (x - mu) / n, writing q back over the row. Accumulating in
+// f32 keeps sum(x - mu) == 0 - the identity the rewritten head relies on to make the vocab's
+// per-row zero point drop out of the MatMul - and keeps the squares out of f16 range.
+template <typename T>
+void split_off_mean_and_norm(T* embeds, T* mean, T* norm, std::size_t rows, std::size_t hidden_size) {
+    for (std::size_t r = 0; r < rows; ++r) {
+        T* row = embeds + r * hidden_size;
+        float sum = 0.0f;
+        for (std::size_t k = 0; k < hidden_size; ++k) {
+            sum += static_cast<float>(row[k]);
+        }
+        const float mu = sum / static_cast<float>(hidden_size);
+        float sum_sq = 0.0f;
+        for (std::size_t k = 0; k < hidden_size; ++k) {
+            const float centred = static_cast<float>(row[k]) - mu;
+            sum_sq += centred * centred;
+        }
+        const float n = std::sqrt(sum_sq);
+        // n multiplies the accumulator right back, so a zero-variance row can just keep q = 0
+        const float inv_n = n > 0.0f ? 1.0f / n : 0.0f;
+        for (std::size_t k = 0; k < hidden_size; ++k) {
+            row[k] = static_cast<T>((static_cast<float>(row[k]) - mu) * inv_n);
+        }
+        mean[r] = static_cast<T>(mu);
+        norm[r] = static_cast<T>(n);
+    }
+}
+}  // anonymous namespace
+
+void ov::npuw::LLMInferRequest::prepare_lm_head_input() {
+    if (!m_lm_head_mean_port || !m_lm_head_norm_port) {
+        return;  // the head was not rewritten - it takes the embeddings as they are
+    }
+    // Rewriting in place is safe: this tensor is the parent request's output_embeds, shared with
+    // the head by pointer, and the head is its only consumer.
+    auto embeds = m_lm_head_request->get_tensor(m_lm_head_embeds_port);
+    auto mean = m_lm_head_request->get_tensor(*m_lm_head_mean_port);
+    auto norm = m_lm_head_request->get_tensor(*m_lm_head_norm_port);
+
+    const auto hidden_size = embeds->get_shape().back();
+    const auto rows = embeds->get_size() / hidden_size;
+    NPUW_ASSERT(mean->get_size() == rows && norm->get_size() == rows);
+
+    const auto& type = embeds->get_element_type();
+    NPUW_ASSERT(mean->get_element_type() == type && norm->get_element_type() == type);
+    if (type == ov::element::f16) {
+        split_off_mean_and_norm(embeds->data<ov::float16>(),
+                                mean->data<ov::float16>(),
+                                norm->data<ov::float16>(),
+                                rows,
+                                hidden_size);
+    } else if (type == ov::element::f32) {
+        split_off_mean_and_norm(embeds->data<float>(), mean->data<float>(), norm->data<float>(), rows, hidden_size);
+    } else {
+        OPENVINO_THROW("NPUW: unsupported LM head embeddings element type ", type);
+    }
+}
+
 void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
                                               ov::SoPtr<ov::ITensor> attention_mask,
                                               ov::SoPtr<ov::ITensor> position_ids,
@@ -1218,6 +1283,7 @@ void ov::npuw::LLMInferRequest::infer_prefill(ov::SoPtr<ov::ITensor> input_ids,
     m_llm_profile["1/prefill:4.lm_head"].record([&]() {
         if (m_lm_head_request) {
             LOG_DEBUG("Calling inference for LM head model.");
+            prepare_lm_head_input();
             m_lm_head_request->infer();
             m_logits = m_lm_head_request->get_tensor(m_lm_head_logits_port);
         } else {
@@ -1362,6 +1428,7 @@ void ov::npuw::LLMInferRequest::infer_generate(ov::SoPtr<ov::ITensor> input_ids,
 
     if (m_lm_head_request) {
         LOG_DEBUG("Calling inference for LM head model asynchronously");
+        prepare_lm_head_input();
         m_lm_head_request->start_async();
         do_update_kvcache();
         m_llm_profile["N/generate:4.copy_lincache"].record([&]() {

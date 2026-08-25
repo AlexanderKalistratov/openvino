@@ -35,6 +35,10 @@ class LLMCompiledModel : public ov::npuw::ICompiledModel {
 
 public:
     static constexpr const char* output_embeds = "npuw_output_embed";
+    // Extra inputs of a MatMul-first LM head (see apply_matmul_first_vocab): the per-row mean
+    // and L2 norm of the activation, which the host strips off before handing it over.
+    static constexpr const char* lm_head_mean = "npuw_lm_head_mean";
+    static constexpr const char* lm_head_norm = "npuw_lm_head_norm";
 
     static constexpr uint32_t whisper_batch_dim = 0u;
     static constexpr uint32_t whisper_seq_len_dim = 2u;

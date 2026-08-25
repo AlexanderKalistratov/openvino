@@ -222,7 +222,7 @@ public:
 // Rewrites the LM head DQ chain so the heavy MatMul consumes the raw u8/i8 weight with only
 // the per-row scale folded onto it - the form the compiler turns into a native mixed-precision
 // (i4/i8 weight x f16 activation) MatMul - and the zero point is corrected away from the graph
-// entirely. The activation is mean-centred and L2-normalized first, so that sum(x - mu) == 0
+// entirely. That needs a mean-centred and L2-normalized activation, so that sum(x - mu) == 0
 // makes both the per-row weight shift and the per-row zero point drop out of the MatMul:
 //   q = (x - mu) / n,  n = ||x - mu||
 //   logits = (q @ (W * s)^T) * n + mu * (rowsum * s),  rowsum[v] = sum_k w[v,k] - K * z[v]
@@ -231,10 +231,17 @@ public:
 // bounded by ||W_row|| for any input. The plainer x @ (W * s)^T - sum(x) * (z * s) form is
 // algebraically the same but has its accumulator inflated by the zero-point term - measured
 // up to 5x on phi-4-mini - only for that term to be cancelled again, which costs f16 precision.
+//
+// The centring and the normalization themselves are NOT built into the graph: the reduction
+// chain in front of the MatMul does not compile on the NPU, and it also hides the MatMul's
+// input 0 behind a Multiply, which risks losing the fused mixed-precision MatMul. Instead the
+// head takes q directly and gets mu and n as two extra per-row inputs, computed on the host by
+// LLMInferRequest::prepare_lm_head_input(). The new Parameters are handed back through
+// `new_params` (a MatcherPass cannot add them to the model itself).
 class MatMulFirstAsymVocab : public ov::pass::MatcherPass {
 public:
     OPENVINO_MATCHER_PASS_RTTI("ov::npuw::MatMulFirstAsymVocab");
-    explicit MatMulFirstAsymVocab() {
+    explicit MatMulFirstAsymVocab(ov::element::Type io_type, ov::ParameterVector* new_params) {
         AsymVocabPattern p;
         const auto& qweight = p.qweight;
         const auto& qcoeff = p.qcoeff;
@@ -326,37 +333,24 @@ public:
                 rowsum_scaled[v] = static_cast<float>(sum - static_cast<int64_t>(row_size) * zerop) * scales[v];
             });
 
-            auto reduce_axis = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, std::vector<int64_t>{-1});
-            auto mean_h = std::make_shared<ov::op::v1::ReduceMean>(hidden, reduce_axis, true);
-            mean_h->set_friendly_name("reduce_mean_h");
-            auto centred = std::make_shared<ov::op::v1::Subtract>(hidden, mean_h);
-            centred->set_friendly_name("centred_h");
-
-            // L2-normalize the activation, which bounds the MatMul accumulator by
-            // ||W_row||_2 = 128 * sqrt(K) for ANY input - 7095 for K=3072, far inside f16 range.
-            // Same op sequence as the model's own RMSNorm (Power/ReduceMean/Add/Sqrt/Divide) so
-            // the NPU's compute-layers-with-higher-precision list covers it and the square cannot
-            // overflow. The norm cancels exactly, so any positive value works and eps is free.
-            const auto scalar = ov::Shape{};
-            auto squared = std::make_shared<ov::op::v1::Power>(
-                centred,
-                ov::op::v0::Constant::create(compute_type, scalar, std::vector<float>{2.0f}));
-            auto mean_squared = std::make_shared<ov::op::v1::ReduceMean>(squared, reduce_axis, true);
-            auto biased = std::make_shared<ov::op::v1::Add>(
-                mean_squared,
-                ov::op::v0::Constant::create(compute_type, scalar, std::vector<float>{1e-6f}));
-            auto rms = std::make_shared<ov::op::v0::Sqrt>(biased);
-            const auto sqrt_k = std::sqrt(static_cast<float>(row_size));
-            auto inv_norm = std::make_shared<ov::op::v1::Divide>(
-                ov::op::v0::Constant::create(compute_type, scalar, std::vector<float>{1.0f / sqrt_k}),
-                rms);
-            inv_norm->set_friendly_name("inv_norm_h");
-            auto norm = std::make_shared<ov::op::v1::Multiply>(
-                rms,
-                ov::op::v0::Constant::create(compute_type, scalar, std::vector<float>{sqrt_k}));
-            norm->set_friendly_name("norm_h");
-            auto normed = std::make_shared<ov::op::v1::Multiply>(centred, inv_norm);
-            normed->set_friendly_name("normed_h");
+            // The two per-row scalars the host peels off the activation. Both are [.., 1] so they
+            // broadcast over the vocab axis of the MatMul result. They are created in the same
+            // element type as the head's embeddings input, so the host can fill all three with one
+            // code path and nothing but i8 or f16 crosses to the device.
+            ov::PartialShape row_scalar_shape = hidden.get_partial_shape();
+            row_scalar_shape[row_scalar_shape.size() - 1] = 1;
+            auto make_row_scalar = [&](const char* name) -> ov::Output<ov::Node> {
+                auto param = std::make_shared<ov::op::v0::Parameter>(io_type, row_scalar_shape);
+                param->set_friendly_name(name);
+                param->output(0).set_names({name});
+                new_params->push_back(param);
+                if (io_type != compute_type) {
+                    return std::make_shared<ov::op::v0::Convert>(param, compute_type)->output(0);
+                }
+                return param->output(0);
+            };
+            auto mean_in = make_row_scalar(ov::npuw::LLMCompiledModel::lm_head_mean);
+            auto norm_in = make_row_scalar(ov::npuw::LLMCompiledModel::lm_head_norm);
 
             // Scale before the MatMul: Multiply(Convert(w), s) is the dequantization pattern the
             // compiler folds into a native mixed-precision MatMul, so the vocab still reaches the
@@ -365,13 +359,15 @@ public:
             auto s_cvt = std::make_shared<ov::op::v0::Convert>(matched_qcoeff, compute_type);
             auto scaled_weight = std::make_shared<ov::op::v1::Multiply>(converted_weight, s_cvt);
             scaled_weight->set_friendly_name("scale_before_matmul");
-            auto new_matmul = std::make_shared<ov::op::v0::MatMul>(normed, scaled_weight, false, true);
+            // Input 0 stays the bare activation - the host already normalized it - which both
+            // keeps the DQ pattern recognizable and keeps the reduction chain off the device.
+            auto new_matmul = std::make_shared<ov::op::v0::MatMul>(hidden, scaled_weight, false, true);
 
             // The MatMul output already carries the per-row scale, so undoing the normalization
             // here reconstructs the logit directly. Doing it the other way round - denormalizing
             // an unscaled accumulator - would rebuild logits/s, which for a small-scale row can be
             // far outside f16 range.
-            auto denormed = std::make_shared<ov::op::v1::Multiply>(new_matmul, norm);
+            auto denormed = std::make_shared<ov::op::v1::Multiply>(new_matmul, norm_in);
             denormed->set_friendly_name("denorm_after_matmul");
 
             // The norm cancels in the correction term (mu/n * rowsum * s * n), so it is left out
@@ -384,7 +380,7 @@ public:
             if (compute_type != ov::element::f16) {
                 rowsum_in = std::make_shared<ov::op::v0::Convert>(rowsum_const, compute_type);
             }
-            auto correction = std::make_shared<ov::op::v1::Multiply>(mean_h, rowsum_in);
+            auto correction = std::make_shared<ov::op::v1::Multiply>(mean_in, rowsum_in);
             correction->set_friendly_name("mean_times_rowsum_scale");
             auto logits = std::make_shared<ov::op::v1::Add>(denormed, correction);
             logits->set_friendly_name("add_after_matmul");
@@ -395,7 +391,8 @@ public:
             LOG_INFO("MatMulFirstAsymVocab: LM head rewritten - vocab "
                      << matched_qweight->get_friendly_name() << " " << qweight_shape << " "
                      << matched_qweight->get_element_type() << " goes into the MatMul scaled but not dequantized"
-                     << ", activation is mean-centred and L2-normalized (compute type " << compute_type << ").");
+                     << ", the mean-centred and L2-normalized activation comes in as " << io_type
+                     << " together with its per-row mean and norm (compute type " << compute_type << ").");
             return true;
         };
         register_matcher(std::make_shared<opp::Matcher>(qres, "MatMulFirstAsymVocab"), std::move(callback));
@@ -512,9 +509,16 @@ bool convert_vocab_to_i8(const std::shared_ptr<ov::Model>& model) {
 }  // namespace
 
 bool ov::npuw::apply_matmul_first_vocab(const std::shared_ptr<ov::Model>& model) {
+    // Run this only on a head that still has its single embeddings input - the pass appends two
+    // more, and it reads the element type of that one to build them.
+    NPUW_ASSERT(model->inputs().size() == 1);
+    ov::ParameterVector new_params;
     ov::pass::GraphRewrite rewr;
-    rewr.add_matcher<MatMulFirstAsymVocab>();
+    rewr.add_matcher<MatMulFirstAsymVocab>(model->input(0).get_element_type(), &new_params);
     auto ran = rewr.run_on_model(model);
+    if (!new_params.empty()) {
+        model->add_parameters(new_params);
+    }
     model->validate_nodes_and_infer_types();
     return ran;
 }
@@ -1299,18 +1303,14 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_INFO("NPUW_LLM_ASYM_VOCAB_AS_INPUT is disabled - the vocab stays a dequantized constant.");
     }
     auto lm_head_model = check_and_cut_lm_head(kvcache_model, m_cfg);
-    if (m_cfg.get<::intel_npu::NPUW_LLM_MATMUL_FIRST_VOCAB>()) {
-        if (!lm_head_model) {
-            LOG_WARN("NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but there is no separate LM head model to "
-                     "rewrite - the LM head is left unmodified. Enable NPUW_LLM_SHARED_HEAD to cut it out.");
-        } else if (!ov::npuw::apply_matmul_first_vocab(lm_head_model)) {
-            LOG_WARN("NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but the LM head vocab MatMul does not match "
-                     "the expected asymmetric dequantization pattern - the LM head is left unmodified.");
-            log_lm_head_weight_chain(lm_head_model);
-        }
-    } else {
+    const bool matmul_first_vocab = m_cfg.get<::intel_npu::NPUW_LLM_MATMUL_FIRST_VOCAB>();
+    if (!matmul_first_vocab) {
         LOG_INFO("NPUW_LLM_MATMUL_FIRST_VOCAB is disabled - the LM head is left unmodified.");
+    } else if (!lm_head_model) {
+        LOG_WARN("NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but there is no separate LM head model to "
+                 "rewrite - the LM head is left unmodified. Enable NPUW_LLM_SHARED_HEAD to cut it out.");
     }
+    // The rewrite itself waits until the head has been reshaped to static shapes - see below.
 
     // Detect attention mask type before the SDPA subgraph is isolated by partitioning.
     // Mask-skipping optimization on HFA regular tiles will be enabled depending on the mask type.
@@ -1409,6 +1409,13 @@ ov::npuw::LLMCompiledModel::LLMCompiledModel(const std::shared_ptr<ov::Model>& m
         LOG_DEBUG("Make LM head model with static shapes");
         ov::npuw::ReshapeSlicedHeadToStatic(axes.batch, m_kvcache_desc.max_generation_token_len)
             .run_on_model(lm_head_model);
+        // Only now: the rewrite appends two statically shaped per-row inputs to the head, while
+        // ReshapeSlicedHeadToStatic above assumes the head still has exactly one input.
+        if (matmul_first_vocab && !ov::npuw::apply_matmul_first_vocab(lm_head_model)) {
+            LOG_WARN("NPUW_LLM_MATMUL_FIRST_VOCAB is enabled, but the LM head vocab MatMul does not match "
+                     "the expected asymmetric dequantization pattern - the LM head is left unmodified.");
+            log_lm_head_weight_chain(lm_head_model);
+        }
     }
 
     LOG_DEBUG("5.1, decompose GroupQueryAttention OP");
