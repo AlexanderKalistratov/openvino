@@ -103,8 +103,9 @@ bool depends_on_past_kv(const ov::Output<ov::Node>& value) {
 }
 
 bool has_past_kv_input(const std::shared_ptr<opv0::Concat>& concat) {
-    return std::any_of(concat->inputs().begin(), concat->inputs().end(), [](const ov::Input<ov::Node>& input) {
-        return traces_to_past_kv(input.get_source_output());
+    const auto inputs = concat->input_values();
+    return std::any_of(inputs.begin(), inputs.end(), [](const ov::Output<ov::Node>& input) {
+        return traces_to_past_kv(input);
     });
 }
 
@@ -123,19 +124,21 @@ void assert_supported_mask_dependencies(const ov::Output<ov::Node>& mask,
         }
         if (const auto parameter = ov::as_type_ptr<opv0::Parameter>(node)) {
             const auto& parameter_name = parameter->get_friendly_name();
-            const bool is_static_query_shape =
-                shape_only && (parameter_name == "input_ids" || parameter_name == "inputs_embeds");
+            // The mask is rebuilt from attention_mask and past_len, so a shape-only use of any
+            // static-shaped input (e.g. ShapeOf(past_key_values) in HF causal masks) is safe.
+            const bool is_static_shape_use = shape_only && parameter->get_partial_shape().is_static();
             const bool is_static_position_ids =
                 parameter_name == "position_ids" && parameter->get_partial_shape().is_static();
             OPENVINO_ASSERT(parameter == attention_mask || parameter_name == ov::npuw::util::kPastLenParamName ||
-                                is_static_query_shape || is_static_position_ids,
+                                is_static_shape_use || is_static_position_ids,
                             "LeftAlignedAttention: SDPA mask depends on unsupported model input ",
                             parameter_name,
                             ": ",
                             sdpa_name);
             continue;
         }
-        const bool input_is_shape_only = shape_only || ov::is_type<opv3::ShapeOf>(node);
+        const bool input_is_shape_only =
+            shape_only || ov::is_type<opv3::ShapeOf>(node) || ov::is_type<opv0::ShapeOf>(node);
         for (const auto& input : node->input_values()) {
             pending.emplace_back(input.get_node_shared_ptr(), input_is_shape_only);
         }
